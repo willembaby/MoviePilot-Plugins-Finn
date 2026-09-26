@@ -54,10 +54,10 @@ class SubscribeCompletionCrossCheck(_PluginBase):
     # 插件元数据
     plugin_name = "订阅完结交叉校验"
     plugin_desc = ("订阅判定完结时到豆瓣（聚合优酷/腾讯/爱奇艺等平台连载状态）与Bangumi交叉校验，"
-                   "防止TMDB数据滞后导致订阅提前完结；源不可用时挂起重试，"
-                   "每日兜底扫描误完结并自动重建订阅。")
+                   "防止TMDB数据滞后导致订阅提前完结；国内剧以豆瓣为准（豆瓣完结而TMDB集数虚高时自动收缩订阅促完结），"
+                   "国外剧以TMDB为准；源不可用时挂起重试，每日兜底扫描误完结并自动重建订阅。")
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png"
-    plugin_version = "1.3"
+    plugin_version = "1.6"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribecompletioncrosscheck_"
@@ -512,6 +512,7 @@ class SubscribeCompletionCrossCheck(_PluginBase):
         logger.info("开始订阅完结交叉校验兜底扫描...")
         try:
             self._retry_pending()
+            self._scan_active()
             self._scan_history()
         except Exception as e:
             logger.error(f"完结交叉校验兜底扫描失败：{e}")
@@ -570,6 +571,103 @@ class SubscribeCompletionCrossCheck(_PluginBase):
             # finished / no_data：正常判定完成，移除记录
             logger.info(f"完结交叉校验：挂起项《{subscribe.name}》校验恢复并确认完结，移除挂起")
         self._save_records(new_records)
+
+    def _scan_active(self):
+        """
+        扫描活跃 TV 订阅（v1.4：国内剧以豆瓣为准）：
+        豆瓣显示已完结（非"更新至"连载状态）且总集数少于订阅集数（TMDB 集数虚高）时，
+        收缩订阅总集数，使缺失集数按豆瓣口径重算，待集齐后由主程序自然判定完结归档。
+        国外剧（豆瓣无条目或非中国大陆出品）以 TMDB 为准，不做收缩。
+        """
+        try:
+            oper = SubscribeOper()
+            subs = [s for s in (oper.list(state="R") or []) if s.type == MediaType.TV.value]
+            if not subs:
+                return
+            api = DoubanApi()
+            shrunk, skipped = [], 0
+            for s in subs:
+                current_total = s.total_episode or 0
+                lack = s.lack_episode or 0
+                if current_total <= 0 or lack <= 0:
+                    continue  # 缺集为0的由主程序正常完结，无需收缩
+                try:
+                    sid = str(s.doubanid) if s.doubanid else self._search_douban_subject(api, s.name, s.year)
+                    if not sid:
+                        skipped += 1  # 豆瓣无条目：按国外/冷门剧处理，以TMDB为准
+                        continue
+                    detail = api.tv_detail(sid)
+                    if not isinstance(detail, dict):
+                        continue
+                    # 年份复核，防同名误匹配
+                    dy, sy = str(detail.get("year") or ""), str(s.year or "")
+                    if dy and sy and dy != sy:
+                        continue
+                    # 国内剧判断
+                    countries = detail.get("countries") or []
+                    if isinstance(countries, str):
+                        countries = [countries]
+                    if not any("中国" in str(c) for c in countries):
+                        skipped += 1  # 国外剧：以TMDB为准
+                        continue
+                    # 连载中（"更新至X集"）不收缩
+                    info = str(detail.get("episodes_info") or "")
+                    if "更新至" in info:
+                        continue
+                    eps = detail.get("episodes_count")
+                    if not eps or int(eps) >= current_total:
+                        continue  # 豆瓣集数不比订阅少：无需收缩
+                    # 条目口径校验：豆瓣集数远小于订阅集数时，判定为分季/拆分条目误匹配
+                    # （如年番搜到第一季条目），跳过收缩，避免连载剧集被误完结
+                    if int(eps) < int(current_total * 0.4):
+                        logger.info(f"完结交叉校验：《{s.name}》豆瓣条目集数 {eps} 与订阅总集数 "
+                                    f"{current_total} 差距过大（疑似分季条目），跳过收缩")
+                        continue
+                    # 国内剧 + 豆瓣已完结 + TMDB 集数虚高 → 收缩
+                    completed = max(current_total - lack, 0)
+                    new_total = max(int(eps), completed)
+                    if new_total >= current_total:
+                        continue
+                    if self._shrink_subscribe(s, new_total):
+                        shrunk.append(f"《{s.name}》{current_total}→{new_total}集（豆瓣已完结，共{eps}集）")
+                except Exception as e:
+                    logger.warn(f"完结交叉校验：活跃订阅《{s.name}》收缩检查异常：{e}")
+            if shrunk:
+                self._send_notification(
+                    f"{self._notify_title_prefix}: MoviePilot订阅完结校验-发现TMDB集数虚高的已完结剧集\n"
+                    f"- 以下国内剧豆瓣显示已完结，订阅总集数已按豆瓣口径收缩，"
+                    f"缺失集数补齐后将自动完结归档：\n"
+                    + "\n".join(f"  ▶ {x}" for x in shrunk)
+                )
+            logger.info(f"完结交叉校验：活跃订阅收缩扫描完成，收缩 {len(shrunk)} 部，"
+                        f"国外剧/无条目跳过 {skipped} 部")
+        except Exception as e:
+            logger.error(f"完结交叉校验：活跃订阅收缩扫描失败：{e}")
+
+    def _shrink_subscribe(self, subscribe, new_total: int) -> bool:
+        """
+        收缩订阅总集数（国内剧豆瓣已完结而 TMDB 集数虚高时）：
+        total_episode 调整为 new_total，lack_episode 按已完成集数重算。
+        缺失归零后由主程序在下次订阅检查时自然判定完结归档。
+        """
+        try:
+            oper = SubscribeOper()
+            old_total = subscribe.total_episode or 0
+            lack = subscribe.lack_episode or 0
+            completed = max(old_total - lack, 0)
+            new_lack = max(new_total - completed, 0)
+            oper.update(subscribe.id, {
+                "total_episode": new_total,
+                "lack_episode": new_lack,
+                "manual_total_episode": 1,
+            })
+            logger.info(f"完结交叉校验：订阅 {subscribe.id}《{subscribe.name}》总集数收缩 "
+                        f"{old_total} → {new_total}（已完成 {completed}，缺失 {new_lack}），"
+                        f"待主程序下次检查时判定完结")
+            return True
+        except Exception as e:
+            logger.error(f"完结交叉校验：收缩订阅 {subscribe.id} 失败：{e}")
+            return False
 
     def _scan_history(self):
         """扫描最近 N 天已完结的电视剧订阅历史，发现误完结自动重建"""
@@ -747,14 +845,14 @@ class SubscribeCompletionCrossCheck(_PluginBase):
     def _search_douban_subject(api: DoubanApi, name: str, year: Optional[str]) -> Optional[str]:
         """
         在豆瓣搜索剧集条目，返回 subject_id。
+        tv_search 部分新版条目搜不到（如 2026 版《将夜》），无结果时用聚合搜索
+        search() 兜底：聚合结果混合电视剧/图书/豆列条目，仅取 target_type == "tv"
+        且 id 有效的条目参与匹配，避免匹配到书籍或垃圾数据。
         """
-        try:
-            res = api.tv_search(name)
-            if not isinstance(res, dict):
-                return None
-            items = res.get("items") or []
+        sub_year = str(year or "")
+
+        def _pick(items: List[dict]) -> Optional[str]:
             best_partial = None
-            sub_year = str(year or "")
             for it in items:
                 if not isinstance(it, dict):
                     continue
@@ -774,9 +872,34 @@ class SubscribeCompletionCrossCheck(_PluginBase):
                     if not sub_year or not item_year or item_year == sub_year:
                         best_partial = str(sid)
             return best_partial
+
+        # 1) 电视剧搜索（常规路径）
+        try:
+            res = api.tv_search(name)
         except Exception as e:
             logger.warn(f"完结交叉校验：豆瓣搜索《{name}》异常（标记不可用）：{e}")
             return None
+        if isinstance(res, dict):
+            sid = _pick(res.get("items") or [])
+            if sid:
+                return sid
+        # 2) 聚合搜索兜底（tv_search 搜不到时）
+        try:
+            res = api.search(name)
+            if isinstance(res, dict):
+                items = [it for it in (res.get("items") or [])
+                         if isinstance(it, dict) and it.get("target_type") == "tv"
+                         and isinstance(it.get("target"), dict)
+                         and (it.get("target") or {}).get("id")]
+                if items:
+                    logger.info(f"完结交叉校验：豆瓣tv搜索无《{name}》结果，"
+                                f"聚合搜索兜底命中 {len(items)} 个剧集条目")
+                sid = _pick(items)
+                if sid:
+                    return sid
+        except Exception as e:
+            logger.warn(f"完结交叉校验：豆瓣聚合搜索《{name}》异常（忽略兜底）：{e}")
+        return None
 
     # ==================== Bangumi 校验 ====================
 
