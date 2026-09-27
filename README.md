@@ -1,6 +1,6 @@
 # MoviePilot 自定义插件包
 
-包含两个针对「订阅剧集追更」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题。
+包含三个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及 Transmission 种子数据文件丢失后的空壳任务清理。
 
 > 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 2 个插件文件）。
 
@@ -35,6 +35,23 @@
 **配置项**：启用、检查时间（Cron）、仅有缺失时通知、飞书 Webhook、通知前缀、立即运行一次。
 
 **依赖**：MoviePilot v2（使用内置 TmdbChain / SubscribeChain）。
+
+### 3. 种子文件清理（TorrentFileCleaner）v1.0
+
+**解决痛点**：手工清理或迁移媒体文件后，Transmission 中残留“数据文件已被删除”的空壳种子任务，占用下载器资源、影响做种统计。
+
+**核心能力**：
+- 定时扫描 Transmission 全部种子，逐一检查数据文件/目录是否仍存在于下载目录
+- 数据文件不存在的“空壳种子”自动从 Transmission 移除任务（**仅删任务，不删文件——文件已不存在**）
+- 兼容 `.part` 后缀（TR 开启 rename-partial-files 时未完成下载不误判）
+- 仅处理 Transmission 类型下载器，不影响 qBittorrent
+- 飞书 Webhook 通知清理结果
+
+**配置项**：启用、执行周期（Cron，默认每 6 小时）、发送通知、飞书 Webhook、通知前缀、立即运行一次。
+
+**依赖**：MoviePilot v2（使用内置 DownloaderHelper）；MoviePilot 容器与 Transmission 需共享下载目录挂载（本插件通过 `download_dir + name` 路径检查数据文件是否存在）。
+
+---
 
 ## 安装方式
 

@@ -34,5 +34,19 @@
       "v1.1": "优化通知文案与检查逻辑",
       "v1.0": "首个版本：TMDB播出日历+媒体库文件状态比对，当日剧集入库检查"
     }
+  },
+  "TorrentFileCleaner": {
+    "name": "种子文件清理",
+    "description": "定期扫描 Transmission 种子，检测数据文件已被删除的种子任务并自动清理（仅删任务不删文件），支持飞书 Webhook 通知。",
+    "labels": "下载",
+    "version": "1.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png",
+    "author": "Finn",
+    "level": 1,
+    "v2": true,
+    "v3": false,
+    "history": {
+      "v1.0": "首个版本：定期扫描 Transmission 种子，数据文件不存在的自动清理任务，兼容 .part 后缀，飞书 Webhook 通知"
+    }
   }
 }
