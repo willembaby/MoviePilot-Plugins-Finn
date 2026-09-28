@@ -1,8 +1,8 @@
 # MoviePilot 自定义插件包
 
-包含三个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及 Transmission 种子数据文件丢失后的空壳任务清理。
+包含三个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及 Transmission / qBittorrent 种子数据文件丢失后的空壳任务清理。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 2 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 3 个插件文件）。
 
 ## 插件列表
 
@@ -36,20 +36,23 @@
 
 **依赖**：MoviePilot v2（使用内置 TmdbChain / SubscribeChain）。
 
-### 3. 种子文件清理（TorrentFileCleaner）v1.0
+### 3. 种子文件清理（TorrentFileCleaner）v1.2
 
-**解决痛点**：手工清理或迁移媒体文件后，Transmission 中残留“数据文件已被删除”的空壳种子任务，占用下载器资源、影响做种统计。
+**解决痛点**：手工清理或迁移媒体文件后，下载器中残留“数据文件已被删除”的空壳种子任务，占用下载器资源、影响做种统计。
 
 **核心能力**：
-- 定时扫描 Transmission 全部种子，逐一检查数据文件/目录是否仍存在于下载目录
-- 数据文件不存在的“空壳种子”自动从 Transmission 移除任务（**仅删任务，不删文件——文件已不存在**）
-- 兼容 `.part` 后缀（TR 开启 rename-partial-files 时未完成下载不误判）
-- 仅处理 Transmission 类型下载器，不影响 qBittorrent
+- 定时扫描 **Transmission + qBittorrent** 全部种子，逐一检查数据文件/目录是否仍存在于下载目录
+- 数据文件不存在的“空壳种子”自动移除任务（**仅删任务，不删文件——文件已不存在**）
+- Transmission：download_dir + name 检查，兼容 `.part` 后缀
+- qBittorrent：content_path / save_path + name 双路径检查，兼容 `.!qB` 后缀
+- **按下载器独立开关**（v1.2）：配置页动态列出全部已配置下载器，每个下载器可独立选择是否执行清理（如多下载器分工场景可排除某些下载器）
+- **每下载器独立路径映射**（v1.2）：映射配置从全局改为按下载器粒度（如仅 qb-other 配 `/downloads=/media`）；插件级映射优先，未配置时自动继承 MoviePilot 下载器设置中的系统级路径映射
+- **全量不可达保护**（v1.1）：某下载器全部种子路径均不存在时判定为挂载问题，跳过该下载器并通知，**防止批量误删**
 - 飞书 Webhook 通知清理结果
 
-**配置项**：启用、执行周期（Cron，默认每 6 小时）、发送通知、飞书 Webhook、通知前缀、立即运行一次。
+**配置项**：启用、执行周期（Cron，默认每 6 小时）、发送通知、各下载器独立开关、各下载器独立路径映射、飞书 Webhook、通知前缀、立即运行一次。
 
-**依赖**：MoviePilot v2（使用内置 DownloaderHelper）；MoviePilot 容器与 Transmission 需共享下载目录挂载（本插件通过 `download_dir + name` 路径检查数据文件是否存在）。
+**依赖**：MoviePilot v2（使用内置 DownloaderHelper）；MoviePilot 容器需能访问下载器的文件路径（共享挂载或配置路径映射）。
 
 ---
 
@@ -58,15 +61,15 @@
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/` 和 `subscribecalendarmonitor/` 两个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/` 和 `torrentfilecleaner/` 三个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-   追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`
-4. 重启 MoviePilot 容器，插件市场即可看到两个插件并配置
+   追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`
+4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
 
-1. 将本包内容推送到 GitHub 仓库（根目录含两个插件目录即可）
+1. 将本包内容推送到 GitHub 仓库（根目录含插件目录与 package.json 即可）
 2. MoviePilot → 设置 → 插件 → 自定义插件源，添加仓库地址（`https://github.com/你的用户名/仓库名`）
 3. 插件市场即可搜到并一键安装，后续插件更新可从市场拉取
 

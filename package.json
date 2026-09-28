@@ -37,15 +37,17 @@
   },
   "TorrentFileCleaner": {
     "name": "种子文件清理",
-    "description": "定期扫描 Transmission 种子，检测数据文件已被删除的种子任务并自动清理（仅删任务不删文件），支持飞书 Webhook 通知。",
+    "description": "定期扫描 Transmission / qBittorrent 种子，检测数据文件已被删除的种子任务并自动清理（仅删任务不删文件）。每个下载器可独立开关与配置容器路径映射，支持全量不可达保护，飞书通知。",
     "labels": "下载",
-    "version": "1.0",
+    "version": "1.2",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png",
     "author": "Finn",
     "level": 1,
     "v2": true,
     "v3": false,
     "history": {
+      "v1.2": "按下载器粒度控制：配置页动态列出全部下载器，每个下载器独立「是否执行清理」开关与独立容器路径映射（插件级映射优先，未配置时自动继承 MoviePilot 下载器设置中的系统级路径映射）",
+      "v1.1": "新增 qBittorrent 支持（content_path/save_path 双路径检查、.!qB 后缀兼容、hash 删除）；新增容器路径映射配置（解决下载器与 MP 容器挂载点不一致）；新增全量不可达保护（全部种子路径不存在时跳过该下载器并通知，防止挂载问题导致批量误删）",
       "v1.0": "首个版本：定期扫描 Transmission 种子，数据文件不存在的自动清理任务，兼容 .part 后缀，飞书 Webhook 通知"
     }
   }
