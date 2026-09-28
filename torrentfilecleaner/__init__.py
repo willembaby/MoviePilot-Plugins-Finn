@@ -47,7 +47,7 @@ class TorrentFileCleaner(_PluginBase):
                    "并自动清理（仅删任务不删文件）。每个下载器可独立开关与配置容器路径映射，"
                    "支持全量不可达保护，飞书通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "torrentfilecleaner_"
@@ -408,24 +408,32 @@ class TorrentFileCleaner(_PluginBase):
         """
         扫描全部下载器种子，检查数据文件是否存在，清理无数据文件的种子任务。
         按下载器配置过滤执行范围，支持 TR/qB，带全量不可达保护。
+        每轮无论是否有清理结果均发送通知（含各下载器扫描统计）。
         """
         try:
             services = DownloaderHelper().get_services()
             if not services:
                 logger.warning("种子文件清理：未找到已连接的下载器，跳过本轮扫描")
+                if self._notify:
+                    self._send_notification(
+                        f"{self._notify_title_prefix}: 种子文件清理-未找到已连接的下载器，跳过本轮扫描")
                 return
 
             total_removed = 0
+            total_scanned = 0
             removed_detail = []
             skipped_downloaders = []
+            scan_stats = []
 
             for name, info in services.items():
                 inst = info.instance
                 mod = type(inst).__module__
+                dl_type = "TR" if "transmission" in mod else ("qB" if "qbittorrent" in mod else "?")
 
                 # 用户开关过滤（未配置的下载器默认执行）
                 if name in self._dl_enable and not self._dl_enable[name]:
                     logger.info(f"种子文件清理：下载器 {name} 已被用户禁用，跳过")
+                    scan_stats.append(f"{name}({dl_type}): 已禁用，跳过")
                     continue
 
                 # 获取该下载器的有效路径映射
@@ -439,29 +447,42 @@ class TorrentFileCleaner(_PluginBase):
                     continue
 
                 if not result:
+                    scan_stats.append(f"{name}({dl_type}): 连接失败，未扫描")
                     continue
-                removed, detail, skipped_reason = result
+                removed, detail, skipped_reason, scanned = result
+                total_scanned += scanned
                 if skipped_reason:
                     skipped_downloaders.append(f"[{name}] {skipped_reason}")
-                if removed > 0:
+                    scan_stats.append(f"{name}({dl_type}): {scanned} 个种子，路径不可达已跳过")
+                elif removed > 0:
                     total_removed += removed
                     removed_detail.extend(detail)
+                    scan_stats.append(f"{name}({dl_type}): {scanned} 个种子，清理 {removed} 个")
+                else:
+                    scan_stats.append(f"{name}({dl_type}): {scanned} 个种子，正常")
 
-            # 通知
+            # 通知：无论是否有清理都发送（保证每轮有执行回执）
             lines = []
             if total_removed > 0:
                 logger.info(f"种子文件清理：本轮共清理 {total_removed} 个无数据种子任务")
                 lines.append(f"{self._notify_title_prefix}: 种子文件清理-已清理 {total_removed} 个无数据种子任务")
                 lines.append("- 以下种子的数据文件已不存在，已从下载器移除任务（未删除文件）：")
                 lines.extend(f"  ▶ {x}" for x in removed_detail)
+            else:
+                logger.info("种子文件清理：本轮扫描完成，未发现无数据文件的种子")
+                lines.append(f"{self._notify_title_prefix}: 种子文件清理-本轮扫描完成（未发现无数据文件种子）")
+                lines.append(f"- 共扫描 {len(scan_stats)} 个下载器 {total_scanned} 个种子，全部正常")
             if skipped_downloaders:
                 logger.warning(f"种子文件清理：以下下载器被跳过：{skipped_downloaders}")
-                lines.append(f"\n⚠ 以下下载器疑似路径不可达已跳过清理（请检查容器挂载或配置路径映射）：")
+                lines.append("")
+                lines.append("⚠ 以下下载器疑似路径不可达已跳过清理（请检查容器挂载或配置路径映射）：")
                 lines.extend(f"  ▶ {x}" for x in skipped_downloaders)
-            if lines and self._notify:
+            if scan_stats:
+                lines.append("")
+                lines.append("- 各下载器明细：")
+                lines.extend(f"  ▶ {x}" for x in scan_stats)
+            if self._notify:
                 self._send_notification("\n".join(lines))
-            if not lines:
-                logger.info("种子文件清理：本轮扫描完成，未发现无数据文件的种子")
 
         except Exception as e:
             logger.error(f"种子文件清理：扫描清理失败：{e}")
@@ -474,12 +495,12 @@ class TorrentFileCleaner(_PluginBase):
     def __clean_transmission(self, name: str, inst,
                              maps: List[Tuple[str, str]]) -> Tuple[int, List[str], Optional[str]]:
         """
-        清理 Transmission 下载器，返回 (删除数, 明细, 跳过原因)
+        清理 Transmission 下载器，返回 (删除数, 明细, 跳过原因, 扫描种子数)
         """
         torrents, err = inst.get_torrents()
         if err:
             logger.error(f"种子文件清理：获取 {name}(TR) 种子列表失败，跳过")
-            return 0, [], None
+            return 0, [], None, 0
 
         logger.info(f"种子文件清理：开始扫描 {name}(TR)，共 {len(torrents)} 个种子")
 
@@ -511,26 +532,26 @@ class TorrentFileCleaner(_PluginBase):
             logger.warning(f"种子文件清理：{name}(TR) 全部 {missing} 个种子路径均不可达，"
                            f"疑似容器挂载不一致，跳过清理防止误删")
             return 0, [], (f"TR 全部 {missing} 个种子路径不可达（如 {sample_dir}），"
-                           f"请检查容器挂载或配置该下载器路径映射")
+                           f"请检查容器挂载或配置该下载器路径映射"), len(torrents)
 
         if remove_ids:
             success = inst.delete_torrents(delete_file=False, ids=remove_ids)
             if success:
                 logger.info(f"种子文件清理：已从 {name}(TR) 清理 {len(remove_ids)} 个无数据种子任务")
-                return len(remove_ids), removed_detail, None
+                return len(remove_ids), removed_detail, None, len(torrents)
             else:
                 logger.error(f"种子文件清理：从 {name}(TR) 删除种子任务失败")
-        return 0, [], None
+        return 0, [], None, len(torrents)
 
     def __clean_qbittorrent(self, name: str, inst,
                             maps: List[Tuple[str, str]]) -> Tuple[int, List[str], Optional[str]]:
         """
-        清理 qBittorrent 下载器，返回 (删除数, 明细, 跳过原因)
+        清理 qBittorrent 下载器，返回 (删除数, 明细, 跳过原因, 扫描种子数)
         """
         torrents, err = inst.get_torrents()
         if err:
             logger.error(f"种子文件清理：获取 {name}(qB) 种子列表失败，跳过")
-            return 0, [], None
+            return 0, [], None, 0
 
         logger.info(f"种子文件清理：开始扫描 {name}(qB)，共 {len(torrents)} 个种子")
 
@@ -576,16 +597,16 @@ class TorrentFileCleaner(_PluginBase):
                            f"疑似容器挂载不一致，跳过清理防止误删")
             map_hint = sample_dir if sample_dir else "qB保存目录"
             return 0, [], (f"qB 全部 {missing} 个种子路径不可达（如 {map_hint}），"
-                           f"请配置该下载器路径映射（如 {map_hint}=MP容器对应路径）")
+                           f"请配置该下载器路径映射（如 {map_hint}=MP容器对应路径）"), len(torrents)
 
         if remove_hashes:
             success = inst.delete_torrents(delete_file=False, ids=remove_hashes)
             if success:
                 logger.info(f"种子文件清理：已从 {name}(qB) 清理 {len(remove_hashes)} 个无数据种子任务")
-                return len(remove_hashes), removed_detail, None
+                return len(remove_hashes), removed_detail, None, len(torrents)
             else:
                 logger.error(f"种子文件清理：从 {name}(qB) 删除种子任务失败")
-        return 0, [], None
+        return 0, [], None, len(torrents)
 
     # ==================== 通知 ====================
 
