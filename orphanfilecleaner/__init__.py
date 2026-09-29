@@ -36,7 +36,7 @@ class OrphanFileCleaner(_PluginBase):
                    "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
                    "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.2"
+    plugin_version = "1.6"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
@@ -53,6 +53,7 @@ class OrphanFileCleaner(_PluginBase):
     _notify_title_prefix = "HA通知"
     _hardlink_search = True      # 是否检查硬链接
     _hardlink_search_dirs = ""  # 硬链接额外搜索目录（每行一个），默认在扫描目录内搜索
+    _sel: List[str] = []         # 勾选集合（内存缓存，避免每次点击写库产生闪烁延迟）
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -65,6 +66,7 @@ class OrphanFileCleaner(_PluginBase):
             self._notify_title_prefix = config.get("notify_title_prefix") or "HA通知"
             self._hardlink_search = bool(config.get("hardlink_search", True))
             self._hardlink_search_dirs = str(config.get("hardlink_search_dirs") or "")
+        self._sel = []
         logger.info(f"孤儿文件清理：配置加载完成，enabled={self._enabled}，"
                     f"扫描目录={self._scan_dirs.strip() or '(未配置)'}")
 
@@ -256,7 +258,11 @@ class OrphanFileCleaner(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         """
-        插件详情页：扫描按钮 + 结果列表 + 删除操作
+        插件详情页（重新排版）：
+        - 顶部：状态摘要 + 操作按钮（主次分级）
+        - 分组：底色横条组头（复选框 + 目录 + 统计 + 组删除）
+        - 条目：四列对齐（勾选/路径/大小/操作），已勾选行浅绿背景
+        - 底部：最近处理记录
         """
         if not self._enabled:
             return [
@@ -274,190 +280,215 @@ class OrphanFileCleaner(_PluginBase):
         items = saved.get("items") or []
         scan_time = saved.get("time", "")
         deleted = self.get_data("deleted") or []
-        selected = self.get_data("selected") or []
+        selected = self._sel
         selected_set = set(selected)
+        hl_count = sum(1 for it in items if it.get("has_hardlink"))
 
         page = []
-        # 操作按钮行：扫描 / 删除选中 / 删除全部 / 清空
+        # ===== 状态摘要 =====
+        page.append({
+            'component': 'VAlert',
+            'props': {
+                'type': 'info',
+                'variant': 'tonal',
+                'density': 'compact',
+                'class': 'mb-2',
+                'text': (f"扫描时间：{scan_time or '尚未扫描'}    孤儿 {len(items)} 项    "
+                         f"有硬链接 {hl_count} 项    已勾选 {len(selected)} 项")
+            }
+        })
+        # ===== 操作按钮（主次分级） =====
         page.append({
             'component': 'VRow',
+            'props': {'class': 'mb-1'},
             'content': [
                 {
                     'component': 'VCol',
                     'props': {'cols': 12, 'md': 3},
-                    'content': [self._btn("扫描数据目录", 'plugin/OrphanFileCleaner/scan', {}, 'primary')]
+                    'content': [self._btn("扫描数据目录", 'plugin/OrphanFileCleaner/scan', {}, 'primary', 'elevated')]
                 },
                 {
                     'component': 'VCol',
                     'props': {'cols': 12, 'md': 3},
                     'content': [self._btn(f"删除选中项（{len(selected)}）", 'plugin/OrphanFileCleaner/delete_selected',
-                                          {'confirm': 'yes'}, 'error')]
+                                          {'confirm': 'yes'}, 'error', 'elevated')]
                 },
                 {
                     'component': 'VCol',
                     'props': {'cols': 12, 'md': 3},
                     'content': [self._btn("删除全部孤儿", 'plugin/OrphanFileCleaner/delete_all',
-                                          {'confirm': 'yes'}, 'error')]
+                                          {'confirm': 'yes'}, 'error', 'text')]
                 },
                 {
                     'component': 'VCol',
                     'props': {'cols': 12, 'md': 3},
                     'content': [self._btn("清空结果", 'plugin/OrphanFileCleaner/clear',
-                                          {'confirm': 'yes'}, 'secondary')]
+                                          {'confirm': 'yes'}, 'secondary', 'text')]
                 },
             ]
         })
-
-        # 状态统计
+        # 使用说明（小字）
         page.append({
-            'component': 'VRow',
-            'content': [
-                {
-                    'component': 'VCol',
-                    'props': {'cols': 12},
-                    'content': [
-                        {
-                            'component': 'VAlert',
-                            'props': {
-                                'type': 'info',
-                                'variant': 'tonal',
-                                'text': f"扫描时间：{scan_time or '尚未扫描'} ｜ 孤儿数：{len(items)} ｜ 有硬链接：{sum(1 for it in items if it.get('has_hardlink'))} ｜ 已选中：{len(selected)}（点复选框勾选，点『删除选中项』批量删除）"
-                            }
-                        }
-                    ]
-                }
-            ]
+            'component': 'div',
+            'props': {'class': 'text-caption text-grey mb-2'},
+            'text': "勾选后点「删除选中项」批量处理；组头复选框一键全选本组；删除方式：移入回收站（可在设置改为彻底删除）"
         })
 
         if not items:
             page.append({
                 'component': 'div',
                 'text': '暂无扫描结果，请点击「扫描数据目录」',
-                'props': {'class': 'text-center text-grey'}
+                'props': {'class': 'text-center text-grey mt-6'}
             })
         else:
-            # 按文件夹分类展示
+            # ===== 按文件夹分组 =====
             groups = {}
             for it in items:
                 d = it.get("dir") or "/"
                 groups.setdefault(d, []).append(it)
             for d in sorted(groups.keys()):
                 g_items = groups[d]
+                sel_in_group = sum(1 for it in g_items if it.get("path") in selected_set)
+                all_selected = len(g_items) > 0 and sel_in_group == len(g_items)
+                # 组头（底色横条）
                 page.append({
                     'component': 'VRow',
+                    'props': {
+                        'class': 'ma-0 mt-3 mb-1 py-2 px-2 d-flex align-center',
+                        'style': 'background: rgba(2,136,209,0.10); border-radius: 8px;'
+                    },
                     'content': [
                         {
                             'component': 'VCol',
-                            'props': {'cols': 12},
+                            'props': {'cols': 12, 'md': 1},
                             'content': [
                                 {
-                                    'component': 'VAlert',
-                                    'props': {
-                                        'type': 'secondary',
-                                        'variant': 'tonal',
-                                        'text': f"📁 {d}（{len(g_items)} 项）"
+                                    'component': 'VCheckboxBtn',
+                                    'props': {'model-value': all_selected, 'density': 'compact'},
+                                    'events': {
+                                        'click': {
+                                            'api': 'plugin/OrphanFileCleaner/toggle_group',
+                                            'method': 'get',
+                                            'params': {'dir': d, 'apikey': settings.API_TOKEN}
+                                        }
                                     }
                                 }
                             ]
-                        }
-                    ]
-                })
-                rows = []
-                for it in sorted(g_items, key=lambda x: x.get("path", "")):
-                    path = it.get("path", "")
-                    ftype = "目录" if it.get("is_dir") else "文件"
-                    size = self._fmt_size(it.get("size", 0))
-                    checked = path in selected_set
-                    rows.append({
-                        'component': 'VCard',
-                        'props': {'variant': 'tonal', 'class': 'mb-1'},
-                        'content': [
-                            {
-                                'component': 'VCardText',
-                                'props': {'class': 'py-1'},
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 1},
-                                                'content': [
-                                                    {
-                                                        'component': 'VCheckboxBtn',
-                                                        'props': {'model-value': checked, 'density': 'compact'},
-                                                        'events': {
-                                                            'click': {
-                                                                'api': 'plugin/OrphanFileCleaner/toggle',
-                                                                'method': 'post',
-                                                                'params': {'path': path, 'apikey': settings.API_TOKEN}
-                                                            }
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 7},
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {'class': 'text-body-2 text-wrap'},
-                                                        'text': f"[{ftype}] {path}（{size}）"
-                                                    },
-                                                    *([{
-                                                        'component': 'VAlert',
-                                                        'props': {
-                                                            'type': 'warning',
-                                                            'variant': 'tonal',
-                                                            'density': 'compact',
-                                                            'class': 'mt-1 text-wrap'
-                                                        },
-                                                        'text': "⚠ 有硬链接（" + str(len(it.get("hardlinks", []))) + " 个）：\n" + "\n".join(it.get("hardlinks", []))
-                                                    }] if it.get("has_hardlink") else [])
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    self._btn("删除此项", 'plugin/OrphanFileCleaner/delete',
-                                                              {'path': path}, 'error')
-                                                ]
-                                            },
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    })
-                page.append({
-                    'component': 'VRow',
-                    'content': [
+                        },
                         {
                             'component': 'VCol',
-                            'props': {'cols': 12},
-                            'content': rows
-                        }
+                            'props': {'cols': 12, 'md': 7},
+                            'content': [
+                                {
+                                    'component': 'div',
+                                    'props': {'class': 'text-subtitle-2 font-weight-bold text-primary'},
+                                    'text': f"📁 {d}"
+                                },
+                                {
+                                    'component': 'div',
+                                    'props': {'class': 'text-caption text-grey'},
+                                    'text': f"{len(g_items)} 项 · 已勾选 {sel_in_group}"
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {'cols': 12, 'md': 4},
+                            'content': [
+                                self._btn("删除本组全部", 'plugin/OrphanFileCleaner/delete_dir',
+                                          {'dir': d, 'confirm': 'yes'}, 'error', 'tonal')
+                            ]
+                        },
                     ]
                 })
+                # 条目行（四列对齐，已勾选浅绿背景）
+                for it in sorted(g_items, key=lambda x: x.get("path", "")):
+                    path = it.get("path", "")
+                    ftype = "🗂" if it.get("is_dir") else "📄"
+                    size = self._fmt_size(it.get("size", 0))
+                    checked = path in selected_set
+                    row_style = 'background: rgba(76,175,80,0.12); border-radius: 6px;' if checked else ''
+                    page.append({
+                        'component': 'VRow',
+                        'props': {'class': 'ma-0 py-1 px-2 d-flex align-center', 'style': row_style},
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 1},
+                                'content': [
+                                    {
+                                        'component': 'VCheckboxBtn',
+                                        'props': {'model-value': checked, 'density': 'compact'},
+                                        'events': {
+                                            'click': {
+                                                'api': 'plugin/OrphanFileCleaner/toggle',
+                                                'method': 'get',
+                                                'params': {'path': path, 'apikey': settings.API_TOKEN}
+                                            }
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-body-2 text-wrap'},
+                                        'text': f"{ftype} {path}"
+                                    },
+                                    *([{
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'warning',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'class': 'mt-1 text-wrap'
+                                        },
+                                        'text': "⚠ 有硬链接（" + str(len(it.get("hardlinks", []))) + " 个）：\n" + "\n".join(it.get("hardlinks", []))
+                                    }] if it.get("has_hardlink") else [])
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2, 'class': 'text-right'},
+                                'content': [
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-body-2 text-grey'},
+                                        'text': size
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    self._btn("删除", 'plugin/OrphanFileCleaner/delete',
+                                              {'path': path}, 'error', 'text')
+                                ]
+                            },
+                        ]
+                    })
 
-        # 最近处理记录
+        # ===== 最近处理记录 =====
         if deleted:
             page.append({
-                'component': 'VCard',
-                'props': {'class': 'mt-3'},
+                'component': 'VRow',
+                'props': {'class': 'mt-4'},
                 'content': [
                     {
-                        'component': 'VCardTitle',
-                        'props': {'class': 'text-subtitle-1'},
-                        'text': f"最近处理记录（{len(deleted)} 条）"
-                    },
-                    {
-                        'component': 'VCardText',
+                        'component': 'VCol',
+                        'props': {'cols': 12},
                         'content': [
-                            {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': f"- {d}"}
-                            for d in deleted[-30:]
+                            {
+                                'component': 'div',
+                                'props': {'class': 'text-subtitle-2 font-weight-bold mb-1'},
+                                'text': f"最近处理记录（{len(deleted)} 条）"
+                            },
+                            *[{'component': 'div', 'props': {'class': 'text-caption text-grey'},
+                               'text': f"· {d}"} for d in deleted[-10:]]
                         ]
                     }
                 ]
@@ -469,37 +500,49 @@ class OrphanFileCleaner(_PluginBase):
             {
                 "path": "/scan",
                 "endpoint": self.scan_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "扫描数据目录中的孤儿文件"
             },
             {
                 "path": "/delete",
                 "endpoint": self.delete_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "删除指定孤儿文件"
             },
             {
                 "path": "/delete_all",
                 "endpoint": self.delete_all_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "删除全部孤儿文件"
             },
             {
                 "path": "/delete_selected",
                 "endpoint": self.delete_selected_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "批量删除勾选中的孤儿文件"
             },
             {
                 "path": "/toggle",
                 "endpoint": self.toggle_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "切换孤儿文件勾选状态"
+            },
+            {
+                "path": "/toggle_group",
+                "endpoint": self.toggle_group_api,
+                "methods": ["GET"],
+                "summary": "一键选中/取消整个文件夹组"
+            },
+            {
+                "path": "/delete_dir",
+                "endpoint": self.delete_dir_api,
+                "methods": ["GET"],
+                "summary": "一键删除文件夹组内全部孤儿"
             },
             {
                 "path": "/clear",
                 "endpoint": self.clear_api,
-                "methods": ["POST"],
+                "methods": ["GET"],
                 "summary": "清空扫描结果"
             },
         ]
@@ -700,7 +743,7 @@ class OrphanFileCleaner(_PluginBase):
             "total": len(items),
         }
         self.save_data("result", result)
-        self.save_data("selected", [])
+        self._sel = []
         # 检查硬链接
         hl_count = 0
         if self._hardlink_search:
@@ -728,10 +771,10 @@ class OrphanFileCleaner(_PluginBase):
             self._append_deleted(f"已{'移入回收站' if self._delete_mode == 'trash' else '删除'}: {path}")
             self._mark_done(path)
             # 同步从选中集合移除
-            selected = self.get_data("selected") or []
+            selected = self._sel
             if path in selected:
                 selected.remove(path)
-                self.save_data("selected", selected)
+                self._sel = selected
         return {"success": ok, "message": msg}
 
     def delete_all_api(self, confirm: str = "") -> Dict[str, Any]:
@@ -753,7 +796,7 @@ class OrphanFileCleaner(_PluginBase):
                 ok_count += 1
         saved["items"] = []
         self.save_data("result", saved)
-        self.save_data("selected", [])
+        self._sel = []
         self._append_deleted(f"批量处理完成：成功 {ok_count}/{len(items)} 个")
         logger.info(f"孤儿文件清理：批量删除完成 {ok_count}/{len(items)}")
         if self._notify:
@@ -768,7 +811,7 @@ class OrphanFileCleaner(_PluginBase):
             return {"success": False, "message": "插件未启用"}
         if confirm != "yes":
             return {"success": False, "message": "请确认参数 confirm=yes"}
-        selected = self.get_data("selected") or []
+        selected = self._sel
         if not selected:
             return {"success": False, "message": "未勾选任何孤儿文件"}
         ok_count = 0
@@ -777,7 +820,7 @@ class OrphanFileCleaner(_PluginBase):
                 continue
             if self._delete_path(p)[0]:
                 ok_count += 1
-        self.save_data("selected", [])
+        self._sel = []
         # 从结果中移除已处理的条目
         saved = self.get_data("result") or {}
         saved["items"] = [it for it in saved.get("items", []) if it.get("path") not in selected]
@@ -795,22 +838,81 @@ class OrphanFileCleaner(_PluginBase):
         """切换勾选状态"""
         if not path:
             return {"success": False, "message": "未指定路径"}
-        selected = self.get_data("selected") or []
+        selected = self._sel
         if path in selected:
             selected.remove(path)
             msg = "已取消勾选"
         else:
             selected.append(path)
             msg = "已勾选"
-        self.save_data("selected", selected)
+        self._sel = selected
         return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def toggle_group_api(self, dir: str) -> Dict[str, Any]:
+        """一键选中/取消整个文件夹组的孤儿"""
+        if not dir:
+            return {"success": False, "message": "未指定文件夹"}
+        saved = self.get_data("result") or {}
+        items = saved.get("items") or []
+        group_paths = [it.get("path") for it in items if it.get("dir") == dir]
+        if not group_paths:
+            return {"success": False, "message": "该文件夹无孤儿条目"}
+        selected = self._sel
+        group_set = set(group_paths)
+        # 组内全部已选中 → 取消全部；否则全选
+        if all(p in selected for p in group_paths):
+            selected = [p for p in selected if p not in group_set]
+            msg = f"已取消勾选 {len(group_paths)} 项"
+        else:
+            for p in group_paths:
+                if p not in selected:
+                    selected.append(p)
+            msg = f"已勾选 {len(group_paths)} 项"
+        self._sel = selected
+        logger.info(f"孤儿文件清理：[{dir}] 组级勾选 {msg}")
+        return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def delete_dir_api(self, dir: str, confirm: str = "") -> Dict[str, Any]:
+        """一键删除文件夹组内全部孤儿（需 confirm=yes）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if not dir:
+            return {"success": False, "message": "未指定文件夹"}
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        saved = self.get_data("result") or {}
+        items = saved.get("items") or []
+        group_items = [it for it in items if it.get("dir") == dir]
+        if not group_items:
+            return {"success": False, "message": "该文件夹无孤儿条目"}
+        ok_count = 0
+        for it in group_items:
+            p = it.get("path", "")
+            if not self._is_in_scan_dirs(p):
+                continue
+            if self._delete_path(p)[0]:
+                ok_count += 1
+        # 从结果移除该组 + 同步清理勾选集合
+        saved["items"] = [it for it in items if it.get("dir") != dir]
+        saved["total"] = len(saved["items"])
+        self.save_data("result", saved)
+        group_paths = set(it.get("path") for it in group_items)
+        selected = self._sel
+        self._sel = [p for p in selected if p not in group_paths]
+        self._append_deleted(f"[{dir}] 组级删除完成：成功 {ok_count}/{len(group_items)} 个")
+        logger.info(f"孤儿文件清理：[{dir}] 组级删除 {ok_count}/{len(group_items)}")
+        if self._notify:
+            mode = "移入回收站" if self._delete_mode == "trash" else "彻底删除"
+            self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-删除文件夹组\n"
+                              f"[{dir}] 成功 {ok_count}/{len(group_items)} 个（{mode}）")
+        return {"success": True, "ok": ok_count, "total": len(group_items)}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         """清空扫描结果"""
         if confirm != "yes":
             return {"success": False, "message": "请确认参数 confirm=yes"}
         self.save_data("result", {"time": "", "items": [], "total": 0})
-        self.save_data("selected", [])
+        self._sel = []
         return {"success": True}
 
     # ==================== 工具 ====================
@@ -888,17 +990,17 @@ class OrphanFileCleaner(_PluginBase):
         self.post_message(title="孤儿文件清理", text=text)
 
     @staticmethod
-    def _btn(text: str, api: str, payload: dict, color: str) -> Dict:
+    def _btn(text: str, api: str, payload: dict, color: str, variant: str = "tonal") -> Dict:
         params = dict(payload)
         params['apikey'] = settings.API_TOKEN
         return {
             "component": "VBtn",
-            "props": {"color": color, "variant": "tonal", "size": "small", "block": True},
+            "props": {"color": color, "variant": variant, "size": "small", "block": True},
             "text": text,
             "events": {
                 "click": {
                     "api": api,
-                    "method": "post",
+                    "method": "get",
                     "params": params,
                 }
             },
