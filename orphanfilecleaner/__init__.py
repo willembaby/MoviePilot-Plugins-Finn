@@ -33,9 +33,10 @@ class OrphanFileCleaner(_PluginBase):
     # 插件元数据
     plugin_name = "孤儿文件清理"
     plugin_desc = ("扫描数据文件目录，找出「有数据文件但无种子引用」的孤儿文件/目录"
-                   "（删种留文件、迁移残留等），支持一键移入回收站或彻底删除。")
+                   "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
+                   "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.0"
+    plugin_version = "1.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
