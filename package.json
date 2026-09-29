@@ -51,5 +51,19 @@
       "v1.1": "新增 qBittorrent 支持（content_path/save_path 双路径检查、.!qB 后缀兼容、hash 删除）；新增容器路径映射配置（解决下载器与 MP 容器挂载点不一致）；新增全量不可达保护（全部种子路径不存在时跳过该下载器并通知，防止挂载问题导致批量误删）",
       "v1.0": "首个版本：定期扫描 Transmission 种子，数据文件不存在的自动清理任务，兼容 .part 后缀，飞书 Webhook 通知"
     }
+  },
+  "OrphanFileCleaner": {
+    "name": "孤儿文件清理",
+    "description": "扫描数据文件目录，找出「有数据文件但无种子引用」的孤儿文件/目录（删种残留、迁移残留等），按文件夹分类展示、勾选批量删除、检测硬链接并列出地址，支持一键移入回收站或彻底删除。",
+    "labels": "下载",
+    "version": "1.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png",
+    "author": "Finn",
+    "level": 1,
+    "v2": true,
+    "v3": false,
+    "history": {
+      "v1.0": "首个版本：收集全部下载器种子引用集合，扫描指定数据目录找出孤儿文件/目录；结果按文件夹分类展示，每条带复选框可勾选，支持批量删除勾选项与删除全部；检测孤儿文件的硬链接并列出所有硬链接地址；默认移入回收站（可恢复），可选彻底删除；支持下载器容器路径映射"
+    }
   }
 }

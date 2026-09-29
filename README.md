@@ -1,8 +1,8 @@
 # MoviePilot 自定义插件包
 
-包含三个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及 Transmission / qBittorrent 种子数据文件丢失后的空壳任务清理。
+包含四个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件清理。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 3 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 4 个插件文件）。
 
 ## 插件列表
 
@@ -57,15 +57,34 @@
 
 ---
 
+### 4. 孤儿文件清理（OrphanFileCleaner）v1.0
+
+**解决痛点**：删除种子时保留文件、手工迁移、中断下载清理种子等场景，会在下载数据目录留下“有数据文件、但已无任何种子引用”的孤儿文件，占用存储空间。
+
+**核心能力**：
+- 收集全部下载器（Transmission + qBittorrent）种子的内容根路径作为引用集合，扫描用户配置的数据文件目录
+- 找出磁盘存在但**任何下载器都无种子引用**的孤儿文件/目录（跨下载器去重，避免误判其他下载器正在做种的内容）
+- 插件详情页**按文件夹分类**展示孤儿列表（路径/类型/大小），每条带**复选框**，可勾选后**批量删除勾选项**，也可删除全部
+- **删除机制**：默认移入回收站目录（可恢复），可选彻底删除；删除前校验路径位于扫描目录范围内
+- **硬链接检测**：对孤儿文件检查硬链接（nlink>1），在搜索范围内找出同 inode 的所有路径并标记列出，提示删除可能影响其他硬链接文件
+- 支持下载器容器路径映射（如 `/downloads=/media`）
+- 飞书/系统通知扫描与处理结果
+
+**配置项**：启用、数据文件目录（每行一个）、下载器路径映射、删除机制（回收站/彻底）、回收站目录、通知。
+
+**依赖**：MoviePilot v2（使用内置 DownloaderHelper）；需与下载器共享存储（路径映射或相同挂载）。
+
+---
+
 ## 安装方式
 
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/` 和 `torrentfilecleaner/` 三个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/` 和 `orphanfilecleaner/` 四个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-   追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`
+   追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`
 4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
