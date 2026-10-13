@@ -1,8 +1,8 @@
 # MoviePilot 自定义插件包
 
-包含四个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件清理。
+包含五个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种的清理。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 4 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 5 个插件文件）。
 
 ## 插件列表
 
@@ -78,15 +78,33 @@
 
 ---
 
+### 5. 站点已删除种子清理（SiteDeletedTorrentCleaner）v1.0
+
+**解决痛点**：站点种子被删除/失效（站点清种、违规删除、Tracker 失效）后，下载器中仍保留对应死种任务，占用做种资源、影响做种统计。
+
+**核心能力**：
+- **判定依据**：读取每个种子的 tracker 报错消息（qBittorrent tracker `msg` / Transmission `lastAnnounceResult`），命中关键词（如 `torrent not found`、`unregistered`、`not registered`、`不存在`、`已删除` 等）即判定为“站点已删除”，关键词可配置
+- **扫描范围**：自动遍历 MoviePilot 全部已配置下载器，另支持**自定义下载器**（不在 MoviePilot 中的 qBittorrent/Transmission，按 `类型|地址|端口|用户名|密码` 填写）
+- **界面交互**：展示死种列表（名称/大小/进度/站点/tracker 报错），单条勾选、组内全选、一键全选；删除单个 / 删除选中 / 删除全部 / 清空结果
+- **删除行为**：默认仅删任务保留文件；可配置「允许删除数据文件」并带**辅种保护**——若数据文件仍被其他种子做种则不删数据文件，仅当无其他种子辅种时才连同数据文件删除
+- **触发方式**：页面手动「扫描死种」+ 配置 cron 定时扫描（可开启「定时扫描后自动删除」）
+- **通知**：飞书 Webhook 或系统消息
+
+**配置项**：启用、执行周期、允许删除数据文件、定时后自动删除、自定义下载器、tracker 判定关键词、飞书 Webhook、通知前缀、立即运行一次。
+
+**依赖**：MoviePilot v2（使用 DownloaderHelper + qbittorrentapi / transmission-rpc 获取 tracker 状态）。
+
+---
+
 ## 安装方式
 
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/` 和 `orphanfilecleaner/` 四个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/` 和 `sitedeletedtorrentcleaner/` 五个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-   追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`
+    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`
 4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
