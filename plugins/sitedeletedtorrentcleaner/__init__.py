@@ -35,7 +35,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -56,6 +56,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _scheduler = None
     _sel = []                     # 当前勾选的条目 id
+    _site_map_cache = None        # 站点域名→站点名 缓存
 
     # ==================== 生命周期 ====================
 
@@ -276,13 +277,19 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                                            'events': {'click': {'api': 'plugin/SiteDeletedTorrentCleaner/toggle',
                                                                'method': 'get',
                                                                'params': {'id': idx, 'apikey': settings.API_TOKEN}}}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [
                                  {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': it.get("name", "")},
                                  {'component': 'div', 'props': {'class': 'text-caption text-grey'},
-                                  'text': f"{self._fmt_size(it.get('size', 0))} · 进度 {self._fmt_progress(it.get('progress', 0))} · {it.get('site', '')}"},
+                                  'text': f"{self._fmt_size(it.get('size', 0))} · 进度 {self._fmt_progress(it.get('progress', 0))}"},
                              ]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 2},
+                             'content': [
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': '站点'},
+                                 {'component': 'div', 'props': {'class': 'text-body-2 text-primary font-weight-medium'},
+                                  'text': it.get("site") or '—'},
+                             ]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                              'content': [
                                  {'component': 'div', 'props': {'class': 'text-caption text-error text-wrap'},
                                   'text': it.get("tracker_status", "") or ""},
@@ -360,6 +367,41 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             return urlparse(url).hostname or ""
         except Exception:
             return ""
+
+    def _site_name_map(self) -> Dict[str, str]:
+        """站点主域名 -> 站点名（来自 MoviePilot 站点管理，带缓存）"""
+        if self._site_map_cache is not None:
+            return self._site_map_cache
+        m = {}
+        try:
+            from app.db.site_oper import SiteOper
+            for site in (SiteOper().list() or []):
+                name = str(getattr(site, "name", "") or "").strip()
+                domain = str(getattr(site, "domain", "") or "").strip().lower()
+                if name and domain:
+                    m[domain] = name
+        except Exception as e:
+            logger.warning(f"站点已删除种子清理：读取站点列表失败：{e}")
+        self._site_map_cache = m
+        return m
+
+    def _match_site_name(self, tracker_url: str) -> str:
+        """tracker URL -> 站点名（匹配站点主域名；匹配不到返回 hostname）"""
+        if not tracker_url:
+            return ""
+        host = self._host_of(tracker_url)
+        if not host:
+            return ""
+        m = self._site_name_map()
+        if not m:
+            return host
+        low = host.lower()
+        if low in m:
+            return m[low]
+        for d, n in m.items():
+            if low.endswith("." + d):
+                return n
+        return host
 
     def _keyword_list(self) -> List[str]:
         return [k.strip() for k in (self._keywords or "").splitlines() if k.strip()]
@@ -450,8 +492,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 if not t_hash:
                     return None
                 t_name = str(getattr(t, "name", "") or "")
-                tracker = str(getattr(t, "trackerList", "") or "") \
-                    or str(getattr(t, "trackers", "") or "")
+                tlist = getattr(t, "tracker_list", None) or getattr(t, "trackerList", None) or []
+                tracker = tlist[0] if isinstance(tlist, (list, tuple)) and tlist else ""
                 return {
                     "hash": t_hash,
                     "name": t_name,
@@ -499,11 +541,11 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return ""
         return ""
 
-    def _tr_tracker_map(self, inst: Any) -> Dict[str, str]:
+    def _tr_tracker_map(self, inst: Any) -> Dict[str, Dict[str, str]]:
         """
         Transmission 专用：transmission-rpc 库取不到 trackerStats，
-        改用直接 RPC 一次性获取全部种子的 tracker 报错信息。
-        返回 {hash: "lastAnnounceResult 拼接"}
+        改用直接 RPC 一次性获取全部种子的 tracker 报错信息与 announce 地址。
+        返回 {hash: {"status": "lastAnnounceResult 拼接", "tracker": "首个 announce URL"}}
         """
         host = getattr(inst, "_host", None)
         if not host:
@@ -523,7 +565,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return out
             r = sess.post(url, headers={"X-Transmission-Session-Id": sid}, auth=(user, pwd),
                           json={"method": "torrent-get",
-                                "arguments": {"fields": ["hashString", "name", "trackerStats"]}},
+                                "arguments": {"fields": ["hashString", "name", "trackerStats", "trackers"]}},
                           timeout=40)
             for t in r.json().get("arguments", {}).get("torrents", []):
                 h = t.get("hashString")
@@ -531,7 +573,12 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     continue
                 msgs = [str(s.get("lastAnnounceResult") or "")
                         for s in (t.get("trackerStats") or []) if isinstance(s, dict)]
-                out[h] = " | ".join(x for x in msgs if x)
+                announces = [str(s.get("announce") or "")
+                             for s in (t.get("trackers") or []) if isinstance(s, dict)]
+                out[h] = {
+                    "status": " | ".join(x for x in msgs if x),
+                    "tracker": announces[0] if announces else "",
+                }
         except Exception as e:
             logger.warning(f"站点已删除种子清理：TR RPC 获取 tracker 状态失败：{e}")
         return out
@@ -563,11 +610,15 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     continue
                 all_data[name][info["hash"]] = info.get("data_id", "")
                 if tr_map is not None:
-                    ts = tr_map.get(info["hash"], "") or ""
+                    tri = tr_map.get(info["hash"]) or {}
+                    ts = tri.get("status", "") or ""
+                    tracker_url = tri.get("tracker", "") or ""
                 else:
                     ts = self._tracker_status(dtype, inst, info["hash"], t)
+                    tracker_url = info.get("tracker", "") or ""
                 if not ts or not self._is_dead(ts):
                     continue
+                site_name = self._match_site_name(tracker_url) or info.get("site", "") or ""
                 dead_items.append({
                     "id": f"{name}|{info['hash']}",
                     "downloader": name,
@@ -576,8 +627,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     "name": info["name"],
                     "size": info["size"],
                     "progress": info["progress"],
-                    "site": info["site"],
-                    "tracker": info["tracker"],
+                    "site": site_name,
+                    "tracker": tracker_url,
                     "tracker_status": ts,
                     "data_id": info["data_id"],
                 })
