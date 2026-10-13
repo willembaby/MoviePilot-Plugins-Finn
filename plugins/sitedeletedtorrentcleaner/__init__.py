@@ -35,7 +35,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
