@@ -11,6 +11,7 @@
 """
 
 from datetime import datetime, timedelta
+import os
 import time
 from typing import Any, List, Dict, Tuple, Optional
 from urllib.parse import urlparse, parse_qs
@@ -36,7 +37,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -56,6 +57,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                  "unauthorized\nnot exist\n不存在\n已删除\ndeleted\nmissing")
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _group_by = "site"            # 展示分组方式：site=按站点 / downloader=按下载器
+    _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
     _scheduler = None
     _sel = []                     # 当前勾选的条目 id
     _site_map_cache = None        # 站点域名→站点名 缓存
@@ -77,6 +79,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             self._group_by = (config.get("group_by") or "site").strip() or "site"
             if self._group_by not in ("site", "downloader"):
                 self._group_by = "site"
+            self._recycle_enabled = bool(config.get("recycle_enabled", True))
         self._sel = []
 
         self.__stop_service()
@@ -123,6 +126,9 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             {"path": "/delete_selected", "endpoint": self.delete_selected_api, "methods": ["GET"], "summary": "批量删除勾选死种"},
             {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部/本组死种（参数 dl 或 site）"},
             {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空扫描结果"},
+            {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
+            {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
+            {"path": "/recycle_clear", "endpoint": self.recycle_clear_api, "methods": ["GET"], "summary": "清空回收站"},
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -151,6 +157,13 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                              'content': [{'component': 'VSwitch', 'props': {'model': 'delete_file', 'label': '允许删除数据文件（带辅种保护）'}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'auto_delete', 'label': '定时扫描后自动删除'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复，关闭后删除不可恢复）'}}]},
                         ]
                     },
                     {
@@ -206,7 +219,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "notify_title_prefix": "HA通知",
             "keywords": "unregistered\nnot found\nnot registered\nnot authorized\nunauthorized\nnot exist\n不存在\n已删除\ndeleted\nmissing",
             "custom_downloaders": "",
-            "group_by": "site"
+            "group_by": "site",
+            "recycle_enabled": True
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -337,8 +351,55 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                                  {'component': 'div', 'props': {'class': 'text-caption text-error text-wrap'},
                                   'text': it.get("tracker_status", "") or ""},
                              ]},
-                        ]
+                         ]
                     })
+        # ==================== 回收站（误删恢复） ====================
+        recycle = self.get_data("recycle") or {}
+        if recycle:
+            page.append({
+                'component': 'VRow',
+                'props': {'class': 'ma-0 mt-5 mb-1 py-2 px-2 d-flex align-center',
+                          'style': 'background: rgba(156,39,176,0.08); border-radius: 8px;'},
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 8},
+                     'content': [
+                         {'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold text-purple'},
+                          'text': f"🗑 删除回收站（{len(recycle)} 条，支持误删恢复）"},
+                         {'component': 'div', 'props': {'class': 'text-caption text-grey'},
+                          'text': "「恢复」= 重新添加种子并校验数据（当初删了数据文件的将重新下载）"},
+                     ]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                     'content': [self._btn("清空回收站", 'plugin/SiteDeletedTorrentCleaner/recycle_clear',
+                                           {'confirm': 'yes'}, 'secondary', 'text')]},
+                ]
+            })
+            for key, rc in sorted(recycle.items(), key=lambda x: x[1].get("deleted_at", ""), reverse=True):
+                df_tag = "⚠已删数据" if rc.get("deleted_file") else "保留数据"
+                page.append({
+                    'component': 'VRow',
+                    'props': {'class': 'ma-0 py-1 px-2 d-flex align-center'},
+                    'content': [
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
+                         'content': [
+                             {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': rc.get("name", "")},
+                             {'component': 'div', 'props': {'class': 'text-caption text-grey'},
+                              'text': f"{rc.get('site') or '—'} · {rc.get('downloader')} · {rc.get('deleted_at', '')} · {df_tag} · {self._fmt_size(rc.get('size', 0))} · 备份: {'种子文件' if rc.get('bk_type') == 'torrent' else '磁力链'}"},
+                         ]},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 5},
+                         'content': [
+                             {'component': 'VRow',
+                              'props': {'class': 'ma-0'},
+                              'content': [
+                                  {'component': 'VCol', 'props': {'cols': 6},
+                                   'content': [self._btn("恢复", 'plugin/SiteDeletedTorrentCleaner/restore',
+                                                         {'id': key}, 'primary', 'tonal')]},
+                                  {'component': 'VCol', 'props': {'cols': 6},
+                                   'content': [self._btn("清除备份", 'plugin/SiteDeletedTorrentCleaner/recycle_delete',
+                                                         {'id': key}, 'error', 'text')]},
+                              ]}
+                         ]},
+                    ]
+                })
         return page
 
     def stop_service(self):
@@ -367,6 +428,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "keywords": self._keywords,
             "custom_downloaders": self._custom_downloaders,
             "group_by": self._group_by,
+            "recycle_enabled": self._recycle_enabled,
         })
 
     # ==================== 工具 ====================
@@ -525,6 +587,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     "progress": tget("progress", 0) or 0,
                     "tracker": tracker,
                     "site": self._host_of(tracker),
+                    "magnet": str(tget("magnet_uri", "") or ""),
+                    "save_path": str(tget("save_path", "") or ""),
                     "data_id": str(tget("content_path", "") or "") \
                         or (str(tget("save_path", "") or "") + "/" + t_name),
                 }
@@ -545,6 +609,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     "progress": float(getattr(t, "percentDone", 0) or 0),
                     "tracker": tracker,
                     "site": self._host_of(tracker),
+                    "save_path": str(getattr(t, "downloadDir", "") or ""),
                     "data_id": str(getattr(t, "downloadDir", "") or "") + "/" + t_name,
                 }
             except Exception:
@@ -664,7 +729,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return out
             r = sess.post(url, headers={"X-Transmission-Session-Id": sid}, auth=(user, pwd),
                           json={"method": "torrent-get",
-                                "arguments": {"fields": ["hashString", "name", "trackerStats", "trackers"]}},
+                                "arguments": {"fields": ["hashString", "name", "trackerStats", "trackers",
+                                                           "magnetLink", "downloadDir"]}},
                           timeout=40)
             for t in r.json().get("arguments", {}).get("torrents", []):
                 h = t.get("hashString")
@@ -677,6 +743,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 out[h] = {
                     "status": " | ".join(x for x in msgs if x),
                     "tracker": announces[0] if announces else "",
+                    "magnet": str(t.get("magnetLink") or ""),
+                    "save_path": str(t.get("downloadDir") or ""),
                 }
         except Exception as e:
             logger.warning(f"站点已删除种子清理：TR RPC 获取 tracker 状态失败：{e}")
@@ -709,14 +777,18 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     continue
                 all_data[name][info["hash"]] = info.get("data_id", "")
                 if tr_map is not None:
-                    # TR：status 与 announce URL 均来自直接 RPC
+                    # TR：status/announce/magnet/save_path 均来自直接 RPC
                     tri = tr_map.get(info["hash"]) or {}
                     ts = tri.get("status", "") or ""
                     tracker_url = tri.get("tracker", "") or ""
+                    magnet = tri.get("magnet", "") or ""
+                    save_path = tri.get("save_path", "") or ""
                 else:
                     # qB：一次 RPC 拿报错 + 真实 announce URL（磁力种子字段为空）
                     ts, qb_url = self._qb_tracker_info(inst, info["hash"], torrent=t)
                     tracker_url = qb_url or info.get("tracker", "") or ""
+                    magnet = info.get("magnet", "") or ""
+                    save_path = info.get("save_path", "") or ""
                 if not ts or not self._is_dead(ts):
                     continue
                 site_name = self._match_site_name(tracker_url) or ""
@@ -732,6 +804,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     "tracker": tracker_url,
                     "tracker_status": ts,
                     "data_id": info["data_id"],
+                    "magnet": magnet,
+                    "save_path": save_path,
                 })
         return dead_items, all_data
 
@@ -887,6 +961,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             for delete_file, hashes in groups.items():
                 if not hashes:
                     continue
+                # 删除前备份到回收站（qB 导出 .torrent / TR 用磁力链）
+                self._backup_group(dl, dtype, inst, items, delete_file, set(hashes))
                 try:
                     if inst.delete_torrents(delete_file=delete_file, ids=hashes):
                         ok += len(hashes)
@@ -895,6 +971,177 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 except Exception as e:
                     logger.error(f"站点已删除种子清理：{dl} 删除种子异常：{e}")
         return ok, kept
+
+    # ==================== 回收站（误删恢复） ====================
+
+    @staticmethod
+    def _recycle_dir() -> str:
+        """备份 .torrent 文件存放目录（插件数据目录下）"""
+        try:
+            base = settings.PLUGIN_DATA_PATH
+        except Exception:
+            base = "/config/plugins"
+        d = os.path.join(str(base), "sitedeleted_recycle")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _safe_name(s: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s or ""))
+    
+    def _backup_group(self, dl: str, dtype: str, inst: Any, items: List[Dict],
+                      delete_file: bool, hash_set: set):
+        """删除前把待删种子备份进回收站"""
+        if not self._recycle_enabled:
+            return
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            rec = {}
+        saved = False
+        for it in items:
+            h = it.get("hash") or ""
+            if not h or h not in hash_set:
+                continue
+            key = it.get("id") or f"{dl}|{h}"
+            if key in rec:
+                continue
+            bk_type, bk_file, bk_magnet = "", "", ""
+            # qB：优先导出 .torrent 文件（完整备份，含 tracker/文件列表）
+            if "qb" in (dtype or ""):
+                try:
+                    qbc = getattr(inst, "qbc", None)
+                    if qbc:
+                        resp = qbc.torrents_export(torrent_hash=h)
+                        content = resp if isinstance(resp, bytes) else getattr(resp, "content", None)
+                        if content and content[:1] == b"d":
+                            fn = f"{self._safe_name(dl)}_{h}.torrent"
+                            with open(os.path.join(self._recycle_dir(), fn), "wb") as f:
+                                f.write(content)
+                            bk_type, bk_file = "torrent", fn
+                except Exception as e:
+                    logger.warning(f"站点已删除种子清理：导出种子文件失败（{it.get('name', '')[:30]}）：{e}")
+            # 回退：磁力链（qB 导出失败 / TR）
+            if not bk_type and it.get("magnet"):
+                bk_type, bk_magnet = "magnet", str(it["magnet"])
+            if not bk_type:
+                logger.warning(f"站点已删除种子清理：该种子无可用备份材料，恢复不可用：{it.get('name', '')[:40]}")
+                continue
+            rec[key] = {
+                "downloader": dl,
+                "dl_type": dtype or "",
+                "hash": h,
+                "name": it.get("name", ""),
+                "site": it.get("site", ""),
+                "size": it.get("size", 0) or 0,
+                "save_path": it.get("save_path", ""),
+                "deleted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "deleted_file": bool(delete_file),
+                "bk_type": bk_type,
+                "bk_file": bk_file,
+                "bk_magnet": bk_magnet,
+            }
+            saved = True
+        if saved:
+            self.save_data("recycle", rec)
+            logger.info(f"站点已删除种子清理：已备份 {sum(1 for _ in rec)} 条回收站记录")
+
+    def restore_api(self, id: str = "") -> Dict[str, Any]:
+        """从回收站恢复误删种子：重新添加（含原保存路径）→ 重新校验 → 开始任务"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if not id:
+            return {"success": False, "message": "未指定条目"}
+        rec = self.get_data("recycle") or {}
+        item = rec.get(id)
+        if not item:
+            return {"success": False, "message": "回收站中无此记录"}
+        inst, dtype = self._get_downloader(item.get("downloader") or "")
+        if not inst:
+            return {"success": False, "message": f"原下载器 {item.get('downloader')} 不可用（自定义配置可能已修改）"}
+        # 备份材料
+        content = None
+        if item.get("bk_type") == "torrent" and item.get("bk_file"):
+            path = os.path.join(self._recycle_dir(), item["bk_file"])
+            if not os.path.isfile(path):
+                return {"success": False, "message": "备份种子文件缺失，无法恢复"}
+            try:
+                with open(path, "rb") as f:
+                    content = f.read()
+            except Exception as e:
+                return {"success": False, "message": f"读取备份文件失败：{e}"}
+        elif item.get("bk_magnet"):
+            content = str(item["bk_magnet"])
+        if not content:
+            return {"success": False, "message": "无可用备份材料"}
+        # 重新添加（暂停添加→校验→启动，避免立刻覆盖已有数据）
+        try:
+            if "transmission" in (dtype or ""):
+                t = inst.add_torrent(content=content, is_paused=True,
+                                     download_dir=item.get("save_path") or None)
+                ok = t is not None
+            else:
+                ok, _ = inst.add_torrent(content=content, is_paused=True,
+                                         download_dir=item.get("save_path") or None)
+        except Exception as e:
+            return {"success": False, "message": f"添加种子失败：{e}"}
+        if not ok:
+            return {"success": False, "message": "添加种子失败（下载器返回失败）"}
+        h = item.get("hash") or ""
+        if h:
+            try:
+                inst.recheck_torrents(ids=[h])
+            except Exception:
+                pass
+            try:
+                inst.start_torrents(ids=[h])
+            except Exception:
+                pass
+        # 成功：清除该记录与备份文件
+        rec.pop(id, None)
+        self.save_data("recycle", rec)
+        if item.get("bk_file"):
+            try:
+                os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
+            except Exception:
+                pass
+        logger.info(f"站点已删除种子清理：已恢复种子 {item.get('name', '')[:40]} → {item.get('downloader')}")
+        return {"success": True,
+                "message": "恢复成功：已重新添加并校验数据" + ("（原数据已删，将重新下载）" if item.get("deleted_file") else "")}
+
+    def recycle_delete_api(self, id: str = "") -> Dict[str, Any]:
+        """清除回收站单条备份（不可恢复）"""
+        if not id:
+            return {"success": False, "message": "未指定条目"}
+        rec = self.get_data("recycle") or {}
+        item = rec.pop(id, None)
+        if not item:
+            return {"success": False, "message": "回收站中无此记录"}
+        self.save_data("recycle", rec)
+        if item.get("bk_file"):
+            try:
+                os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
+            except Exception:
+                pass
+        return {"success": True, "message": "已清除该备份"}
+
+    def recycle_clear_api(self, confirm: str = "") -> Dict[str, Any]:
+        """清空回收站"""
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        self.save_data("recycle", {})
+        # 清理备份目录中的 .torrent 文件
+        try:
+            d = self._recycle_dir()
+            for fn in os.listdir(d):
+                if fn.endswith(".torrent"):
+                    try:
+                        os.remove(os.path.join(d, fn))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {"success": True, "message": "回收站已清空"}
 
     def delete_api(self, id: str, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
