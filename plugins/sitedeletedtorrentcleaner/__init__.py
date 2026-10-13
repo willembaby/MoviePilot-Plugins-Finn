@@ -499,6 +499,43 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return ""
         return ""
 
+    def _tr_tracker_map(self, inst: Any) -> Dict[str, str]:
+        """
+        Transmission 专用：transmission-rpc 库取不到 trackerStats，
+        改用直接 RPC 一次性获取全部种子的 tracker 报错信息。
+        返回 {hash: "lastAnnounceResult 拼接"}
+        """
+        host = getattr(inst, "_host", None)
+        if not host:
+            return {}
+        proto = getattr(inst, "_protocol", "http") or "http"
+        port = getattr(inst, "_port", None)
+        user = getattr(inst, "_username", "") or ""
+        pwd = getattr(inst, "_password", "") or ""
+        url = f"{proto}://{host}:{port}/transmission/rpc" if port \
+            else f"{proto}://{host}/transmission/rpc"
+        out = {}
+        try:
+            sess = requests.Session()
+            r1 = sess.post(url, data={}, auth=(user, pwd), timeout=20)
+            sid = r1.headers.get("X-Transmission-Session-Id")
+            if not sid:
+                return out
+            r = sess.post(url, headers={"X-Transmission-Session-Id": sid}, auth=(user, pwd),
+                          json={"method": "torrent-get",
+                                "arguments": {"fields": ["hashString", "name", "trackerStats"]}},
+                          timeout=40)
+            for t in r.json().get("arguments", {}).get("torrents", []):
+                h = t.get("hashString")
+                if not h:
+                    continue
+                msgs = [str(s.get("lastAnnounceResult") or "")
+                        for s in (t.get("trackerStats") or []) if isinstance(s, dict)]
+                out[h] = " | ".join(x for x in msgs if x)
+        except Exception as e:
+            logger.warning(f"站点已删除种子清理：TR RPC 获取 tracker 状态失败：{e}")
+        return out
+
     # ==================== 扫描 ====================
 
     def _scan_all(self) -> Tuple[List[Dict], Dict[str, Dict[str, str]]]:
@@ -518,12 +555,17 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 continue
             logger.info(f"站点已删除种子清理：{name} 共 {len(torrents)} 个种子待检查")
             all_data.setdefault(name, {})
+            # Transmission 用直接 RPC 批量获取 tracker 状态（transmission-rpc 取不到 trackerStats）
+            tr_map = self._tr_tracker_map(inst) if "transmission" in dtype else None
             for t in torrents:
                 info = self._torrent_info(dtype, t)
                 if not info or not info.get("hash"):
                     continue
                 all_data[name][info["hash"]] = info.get("data_id", "")
-                ts = self._tracker_status(dtype, inst, info["hash"], t)
+                if tr_map is not None:
+                    ts = tr_map.get(info["hash"], "") or ""
+                else:
+                    ts = self._tracker_status(dtype, inst, info["hash"], t)
                 if not ts or not self._is_dead(ts):
                     continue
                 dead_items.append({
