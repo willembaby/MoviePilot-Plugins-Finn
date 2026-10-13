@@ -35,7 +35,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -541,6 +541,36 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return ""
         return ""
 
+    def _qb_tracker_info(self, inst: Any, hash_string: str) -> Tuple[str, str]:
+        """
+        qBittorrent：一次 RPC 同时拿 tracker 报错消息与真实 announce URL。
+        磁力链接种子的 torrents 字段 tracker 为空，必须从 trackers 列表取；
+        过滤 DHT/PEX/LSD 伪 tracker（** [DHT] ** 等）。
+        返回 (报错消息拼接, 真实 announce URL)
+        """
+        try:
+            qbc = getattr(inst, "qbc", None)
+            if not qbc:
+                return "", ""
+            trs = qbc.torrents_trackers(torrent_hash=hash_string) or []
+            msgs = []
+            real_url = ""
+            for x in trs:
+                if not isinstance(x, dict):
+                    continue
+                url = str(x.get("url") or "")
+                if url.startswith("**"):
+                    continue
+                msg = str(x.get("msg") or "")
+                if msg:
+                    msgs.append(msg)
+                if url and not real_url:
+                    real_url = url
+            return " | ".join(msgs), real_url
+        except Exception as e:
+            logger.warning(f"站点已删除种子清理：获取 qBittorrent tracker 信息失败：{e}")
+            return "", ""
+
     def _tr_tracker_map(self, inst: Any) -> Dict[str, Dict[str, str]]:
         """
         Transmission 专用：transmission-rpc 库取不到 trackerStats，
@@ -602,7 +632,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 continue
             logger.info(f"站点已删除种子清理：{name} 共 {len(torrents)} 个种子待检查")
             all_data.setdefault(name, {})
-            # Transmission 用直接 RPC 批量获取 tracker 状态（transmission-rpc 取不到 trackerStats）
+            # Transmission：transmission-rpc 取不到 trackerStats，直接 RPC 批量获取
             tr_map = self._tr_tracker_map(inst) if "transmission" in dtype else None
             for t in torrents:
                 info = self._torrent_info(dtype, t)
@@ -610,15 +640,17 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     continue
                 all_data[name][info["hash"]] = info.get("data_id", "")
                 if tr_map is not None:
+                    # TR：status 与 announce URL 均来自直接 RPC
                     tri = tr_map.get(info["hash"]) or {}
                     ts = tri.get("status", "") or ""
                     tracker_url = tri.get("tracker", "") or ""
                 else:
-                    ts = self._tracker_status(dtype, inst, info["hash"], t)
-                    tracker_url = info.get("tracker", "") or ""
+                    # qB：一次 RPC 拿报错 + 真实 announce URL（磁力种子字段为空）
+                    ts, qb_url = self._qb_tracker_info(inst, info["hash"])
+                    tracker_url = qb_url or info.get("tracker", "") or ""
                 if not ts or not self._is_dead(ts):
                     continue
-                site_name = self._match_site_name(tracker_url) or info.get("site", "") or ""
+                site_name = self._match_site_name(tracker_url) or ""
                 dead_items.append({
                     "id": f"{name}|{info['hash']}",
                     "downloader": name,
