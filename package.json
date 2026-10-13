@@ -76,13 +76,14 @@
     "name": "站点已删除种子清理",
     "description": "扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），提供勾选/全选/删除界面，支持辅种保护删除数据文件、定时与手动触发、飞书或系统通知。",
     "labels": "下载",
-    "version": "1.2",
+    "version": "1.3",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png",
     "author": "Finn",
     "level": 1,
     "v2": true,
     "v3": false,
     "history": {
+      "v1.3": "修复 qBittorrent 磁力链接种子站点名称为空：改从 torrents_trackers 列表取真实 announce URL 用于站点匹配（过滤 DHT/PEX/LSD 伪 tracker），一次 RPC 同时获取报错与 URL",
       "v1.2": "展示界面新增站点名称字段：按 tracker 域名匹配 MoviePilot 站点管理中的站点名显示（如「馒头/家园/观众」），匹配不到显示域名；同步修复 Transmission 种子站点字段为空的问题",
       "v1.1": "修复 TR 下载器 tracker 状态读取：transmission-rpc 库取不到 trackerStats，改为直接 RPC 获取，TR 现能查出站点已删除死种",
       "v1.0": "首个版本：遍历 MoviePilot 与自定义下载器，按种子 tracker 报错关键词判定为站点已删除死种；页面勾选/全选/删除；站点保护（数据文件仍被其他种子做种则不删数据文件）；定时扫描可配自动删除；飞书或系统通知"
