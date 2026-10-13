@@ -100,5 +100,3 @@
 - 源码不含任何个人配置（Webhook、Token 等均在安装后由配置页面填写）
 - 豆瓣数据接口为 MoviePilot 内置模块，无需额外 Key；Bangumi 无需 Key
 - 兼容性：基于 MoviePilot v2 API 开发；MoviePilot v3（新架构）可能需要适配
-
-> AI生成
