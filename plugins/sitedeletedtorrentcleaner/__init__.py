@@ -11,8 +11,9 @@
 """
 
 from datetime import datetime, timedelta
+import time
 from typing import Any, List, Dict, Tuple, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,7 +36,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -268,6 +269,10 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 all_selected = len(g_items) > 0 and sel_in_group == len(g_items)
                 toggle_params = ({'site': d} if site_mode else {'dl': d})
                 delete_params = ({'site': d} if site_mode else {'dl': d})
+                # 未知站点（组名为空）用哨兵标记，避免 API 把空参当"全部"
+                if site_mode and not d:
+                    toggle_params = {'site': '__NONE__'}
+                    delete_params = {'site': '__NONE__'}
                 # 组内跨下载器统计（按站点分组时显示下载器分布）
                 if site_mode:
                     dl_dist = {}
@@ -580,35 +585,60 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 return ""
         return ""
 
-    def _qb_tracker_info(self, inst: Any, hash_string: str) -> Tuple[str, str]:
+    def _qb_tracker_info(self, inst: Any, hash_string: str, torrent: Any = None) -> Tuple[str, str]:
         """
         qBittorrent：一次 RPC 同时拿 tracker 报错消息与真实 announce URL。
         磁力链接种子的 torrents 字段 tracker 为空，必须从 trackers 列表取；
         过滤 DHT/PEX/LSD 伪 tracker（** [DHT] ** 等）。
+        批量扫描时偶发请求失败，带重试；URL 回退链：RPC trackers → 种子 tracker 字段 → magnet_uri 的 tr=。
         返回 (报错消息拼接, 真实 announce URL)
         """
-        try:
-            qbc = getattr(inst, "qbc", None)
-            if not qbc:
-                return "", ""
-            trs = qbc.torrents_trackers(torrent_hash=hash_string) or []
-            msgs = []
-            real_url = ""
-            for x in trs:
-                if not isinstance(x, dict):
-                    continue
-                url = str(x.get("url") or "")
-                if url.startswith("**"):
-                    continue
-                msg = str(x.get("msg") or "")
-                if msg:
-                    msgs.append(msg)
-                if url and not real_url:
-                    real_url = url
-            return " | ".join(msgs), real_url
-        except Exception as e:
-            logger.warning(f"站点已删除种子清理：获取 qBittorrent tracker 信息失败：{e}")
+        msgs = []
+        real_url = ""
+        qbc = getattr(inst, "qbc", None)
+        if not qbc:
             return "", ""
+        for attempt in range(2):
+            try:
+                trs = qbc.torrents_trackers(torrent_hash=hash_string) or []
+                for x in trs:
+                    if not isinstance(x, dict):
+                        continue
+                    url_ = str(x.get("url") or "")
+                    if url_.startswith("**"):
+                        continue
+                    msg = str(x.get("msg") or "")
+                    if msg:
+                        msgs.append(msg)
+                    if url_ and not real_url:
+                        real_url = url_
+                break
+            except Exception as e:
+                if attempt == 0:
+                    try:
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
+                    continue
+                logger.warning(f"站点已删除种子清理：获取 qBittorrent tracker 信息失败：{e}")
+                break
+        # 回退1：种子自带 tracker 字段（.torrent 添加的私有种有值）
+        if not real_url and torrent is not None:
+            try:
+                tget = torrent.get if hasattr(torrent, "get") else None
+                real_url = str((tget("tracker") if tget else "") or "") or ""
+            except Exception:
+                real_url = ""
+        # 回退2：magnet_uri 内的 tr= 参数（磁力链全部带）
+        if not real_url and torrent is not None:
+            try:
+                tget = torrent.get if hasattr(torrent, "get") else None
+                mu = str((tget("magnet_uri") if tget else "") or "")
+                qs = parse_qs(urlparse(mu).query).get("tr") or []
+                real_url = str(qs[0]) if qs else ""
+            except Exception:
+                real_url = ""
+        return " | ".join(msgs), real_url
 
     def _tr_tracker_map(self, inst: Any) -> Dict[str, Dict[str, str]]:
         """
@@ -685,7 +715,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     tracker_url = tri.get("tracker", "") or ""
                 else:
                     # qB：一次 RPC 拿报错 + 真实 announce URL（磁力种子字段为空）
-                    ts, qb_url = self._qb_tracker_info(inst, info["hash"])
+                    ts, qb_url = self._qb_tracker_info(inst, info["hash"], torrent=t)
                     tracker_url = qb_url or info.get("tracker", "") or ""
                 if not ts or not self._is_dead(ts):
                     continue
@@ -755,11 +785,13 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         return {"success": True, "message": msg, "selected_count": len(selected)}
 
     def toggle_all_api(self, dl: str = "", site: str = "") -> Dict[str, Any]:
-        """组内/全部一键勾选（dl/site 均空则全部；优先 dl）"""
+        """组内/全部一键勾选（dl/site 均空则全部；site=__NONE__ 表示未知站点组；优先 dl）"""
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         if dl:
             ids = [it.get("id") for it in items if it.get("downloader") == dl]
+        elif site == "__NONE__":
+            ids = [it.get("id") for it in items if not (it.get("site") or "").strip()]
         elif site:
             ids = [it.get("id") for it in items if (it.get("site") or "").strip() == site]
         else:
@@ -901,7 +933,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         return {"success": True, "ok": ok, "total": len(targets)}
 
     def delete_all_api(self, dl: str = "", site: str = "", confirm: str = "") -> Dict[str, Any]:
-        """删除全部/本组死种（dl/site 均空则全部；优先 dl）"""
+        """删除全部/本组死种（dl/site 均空则全部；site=__NONE__ 表示未知站点组；优先 dl）"""
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         if confirm != "yes":
@@ -910,6 +942,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         items = saved.get("items") or []
         if dl:
             targets = [it for it in items if it.get("downloader") == dl]
+        elif site == "__NONE__":
+            targets = [it for it in items if not (it.get("site") or "").strip()]
         elif site:
             targets = [it for it in items if (it.get("site") or "").strip() == site]
         else:
