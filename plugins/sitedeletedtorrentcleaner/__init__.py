@@ -35,7 +35,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -54,6 +54,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     _keywords = ("unregistered\nnot found\nnot registered\nnot authorized\n"
                  "unauthorized\nnot exist\n不存在\n已删除\ndeleted\nmissing")
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
+    _group_by = "site"            # 展示分组方式：site=按站点 / downloader=按下载器
     _scheduler = None
     _sel = []                     # 当前勾选的条目 id
     _site_map_cache = None        # 站点域名→站点名 缓存
@@ -72,6 +73,9 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             self._notify_title_prefix = config.get("notify_title_prefix") or "HA通知"
             self._keywords = config.get("keywords") or self._keywords
             self._custom_downloaders = config.get("custom_downloaders") or ""
+            self._group_by = (config.get("group_by") or "site").strip() or "site"
+            if self._group_by not in ("site", "downloader"):
+                self._group_by = "site"
         self._sel = []
 
         self.__stop_service()
@@ -113,10 +117,10 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         return [
             {"path": "/scan", "endpoint": self.scan_api, "methods": ["GET"], "summary": "扫描全部下载器的死种"},
             {"path": "/toggle", "endpoint": self.toggle_api, "methods": ["GET"], "summary": "切换死种勾选状态"},
-            {"path": "/toggle_all", "endpoint": self.toggle_all_api, "methods": ["GET"], "summary": "组内/全部勾选"},
+            {"path": "/toggle_all", "endpoint": self.toggle_all_api, "methods": ["GET"], "summary": "按组/全部一键勾选（参数 dl 或 site）"},
             {"path": "/delete", "endpoint": self.delete_api, "methods": ["GET"], "summary": "删除单个死种"},
             {"path": "/delete_selected", "endpoint": self.delete_selected_api, "methods": ["GET"], "summary": "批量删除勾选死种"},
-            {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部/本组死种"},
+            {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部/本组死种（参数 dl 或 site）"},
             {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空扫描结果"},
         ]
 
@@ -151,9 +155,19 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSelect', 'props': {'model': 'group_by', 'label': '展示分组方式', 'items': [
+                                 {'title': '按站点分组（跨下载器聚合）', 'value': 'site'},
+                                 {'title': '按下载器分组', 'value': 'downloader'},
+                             ]}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 8},
                              'content': [{'component': 'VTextField', 'props': {'model': 'cron', 'label': '执行周期(Cron)', 'placeholder': '0 3 * * *（每天3点）'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 8},
                              'content': [{'component': 'VTextField', 'props': {'model': 'notify_title_prefix', 'label': '通知前缀', 'placeholder': 'HA通知'}}]},
                         ]
                     },
@@ -190,7 +204,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "webhook": "",
             "notify_title_prefix": "HA通知",
             "keywords": "unregistered\nnot found\nnot registered\nnot authorized\nunauthorized\nnot exist\n不存在\n已删除\ndeleted\nmissing",
-            "custom_downloaders": ""
+            "custom_downloaders": "",
+            "group_by": "site"
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -237,14 +252,32 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         if not items:
             page.append({'component': 'div', 'text': '暂无结果，请点击「扫描死种」', 'props': {'class': 'text-center text-grey mt-6'}})
         else:
+            # 分组键：默认按站点（跨下载器聚合），可选按下载器
+            site_mode = self._group_by != "downloader"
+            group_field = "site" if site_mode else "downloader"
+            unknown_label = "未知站点" if site_mode else "未知下载器"
             groups = {}
             for it in items:
-                d = it.get("downloader") or "未知下载器"
-                groups.setdefault(d, []).append(it)
-            for d in sorted(groups.keys()):
+                k = (it.get(group_field) or "").strip()
+                groups.setdefault(k, []).append(it)
+            # 组排序：正常组按名称，未知组最后
+            for d in sorted(groups.keys(), key=lambda x: (x == "", x)):
                 g_items = groups[d]
+                g_label = d or unknown_label
                 sel_in_group = sum(1 for it in g_items if it.get("id") in selected_set)
                 all_selected = len(g_items) > 0 and sel_in_group == len(g_items)
+                toggle_params = ({'site': d} if site_mode else {'dl': d})
+                delete_params = ({'site': d} if site_mode else {'dl': d})
+                # 组内跨下载器统计（按站点分组时显示下载器分布）
+                if site_mode:
+                    dl_dist = {}
+                    for it in g_items:
+                        dln = it.get("downloader") or "未知下载器"
+                        dl_dist[dln] = dl_dist.get(dln, 0) + 1
+                    stat_text = (f"{len(g_items)} 项 · 已勾选 {sel_in_group} · "
+                                 + " / ".join(f"{k}:{v}" for k, v in sorted(dl_dist.items())))
+                else:
+                    stat_text = f"{len(g_items)} 项 · 已勾选 {sel_in_group}"
                 page.append({
                     'component': 'VRow',
                     'props': {'class': 'ma-0 mt-3 mb-1 py-2 px-2 d-flex align-center',
@@ -255,19 +288,24 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                                        'props': {'model-value': all_selected, 'density': 'compact'},
                                        'events': {'click': {'api': 'plugin/SiteDeletedTorrentCleaner/toggle_all',
                                                            'method': 'get',
-                                                           'params': {'dl': d, 'apikey': settings.API_TOKEN}}}}]},
+                                                           'params': {**toggle_params, 'apikey': settings.API_TOKEN}}}}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
-                         'content': [{'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold text-primary'}, 'text': f"⬇ {d}"},
-                                      {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': f"{len(g_items)} 项 · 已勾选 {sel_in_group}"}]},
+                         'content': [{'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold text-primary'}, 'text': ("🎬 " if site_mode else "⬇ ") + g_label},
+                                      {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': stat_text}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                          'content': [self._btn("删除本组全部", 'plugin/SiteDeletedTorrentCleaner/delete_all',
-                                               {'dl': d, 'confirm': 'yes'}, 'error', 'tonal')]},
+                                               {**delete_params, 'confirm': 'yes'}, 'error', 'tonal')]},
                     ]
                 })
                 for it in sorted(g_items, key=lambda x: x.get("name", "")):
                     idx = it.get("id", "")
                     checked = idx in selected_set
                     row_style = 'background: rgba(76,175,80,0.12); border-radius: 6px;' if checked else ''
+                    # 按站点分组时第3列显示所属下载器，按下载器分组时显示站点
+                    if site_mode:
+                        col_label, col_value, col_class = '下载器', it.get("downloader") or '—', 'text-body-2 text-grey-darken-1 font-weight-medium'
+                    else:
+                        col_label, col_value, col_class = '站点', it.get("site") or '—', 'text-body-2 text-primary font-weight-medium'
                     page.append({
                         'component': 'VRow',
                         'props': {'class': 'ma-0 py-1 px-2 d-flex align-center', 'style': row_style},
@@ -285,9 +323,9 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                              ]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 2},
                              'content': [
-                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': '站点'},
-                                 {'component': 'div', 'props': {'class': 'text-body-2 text-primary font-weight-medium'},
-                                  'text': it.get("site") or '—'},
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': col_label},
+                                 {'component': 'div', 'props': {'class': col_class},
+                                  'text': col_value},
                              ]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                              'content': [
@@ -323,6 +361,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "notify_title_prefix": self._notify_title_prefix,
             "keywords": self._keywords,
             "custom_downloaders": self._custom_downloaders,
+            "group_by": self._group_by,
         })
 
     # ==================== 工具 ====================
@@ -715,12 +754,14 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         self._sel = selected
         return {"success": True, "message": msg, "selected_count": len(selected)}
 
-    def toggle_all_api(self, dl: str = "") -> Dict[str, Any]:
-        """组内/全部一键勾选（dl 为空则全部）"""
+    def toggle_all_api(self, dl: str = "", site: str = "") -> Dict[str, Any]:
+        """组内/全部一键勾选（dl/site 均空则全部；优先 dl）"""
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         if dl:
             ids = [it.get("id") for it in items if it.get("downloader") == dl]
+        elif site:
+            ids = [it.get("id") for it in items if (it.get("site") or "").strip() == site]
         else:
             ids = [it.get("id") for it in items]
         if not ids:
@@ -859,14 +900,20 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-清理勾选 {ok}/{len(targets)} 个死种")
         return {"success": True, "ok": ok, "total": len(targets)}
 
-    def delete_all_api(self, dl: str = "", confirm: str = "") -> Dict[str, Any]:
+    def delete_all_api(self, dl: str = "", site: str = "", confirm: str = "") -> Dict[str, Any]:
+        """删除全部/本组死种（dl/site 均空则全部；优先 dl）"""
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         if confirm != "yes":
             return {"success": False, "message": "请确认参数 confirm=yes"}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
-        targets = items if not dl else [it for it in items if it.get("downloader") == dl]
+        if dl:
+            targets = [it for it in items if it.get("downloader") == dl]
+        elif site:
+            targets = [it for it in items if (it.get("site") or "").strip() == site]
+        else:
+            targets = items
         if not targets:
             return {"success": False, "message": "当前无结果"}
         ok, _ = self._delete_entries(targets)
