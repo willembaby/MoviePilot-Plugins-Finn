@@ -99,9 +99,10 @@ class CrossSeedCleaner(_PluginBase):
     plugin_name = "跨站做种清理"
     plugin_desc = ("按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数："
                    "仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；"
-                   "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发。")
+                   "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
+                   "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.0"
+    plugin_version = "1.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -506,6 +507,25 @@ class CrossSeedCleaner(_PluginBase):
         except Exception:
             return "0 KB"
 
+    @staticmethod
+    def _fmt_site_stats(site_stats: Dict[str, Dict[str, int]]) -> str:
+        """站点维度删除统计 -> 多行文本（按清理数量降序，仅删任务的数据不计释放量）"""
+        if not site_stats:
+            return "  （无）"
+        lines = []
+        for site, st in sorted(site_stats.items(), key=lambda x: -x[1].get("count", 0)):
+            cnt = st.get("count", 0)
+            freed = st.get("freed", 0) or 0
+            tonly = st.get("torrent_only", 0) or 0
+            if freed:
+                part = f"{site}: {cnt} 个种子，释放 {CrossSeedCleaner._fmt_size(freed)}"
+                if tonly:
+                    part += f"（另 {tonly} 个仅删任务）"
+            else:
+                part = f"{site}: {cnt} 个种子（仅删任务，数据被辅种引用保留）"
+            lines.append(f"  ▶ {part}")
+        return "\n".join(lines)
+
     def site_display(self, key: str) -> str:
         """站点主域 key -> 展示名"""
         if not key:
@@ -791,11 +811,12 @@ class CrossSeedCleaner(_PluginBase):
                     protected_n += 1
                     continue
             first_site = (list(site_keys) or [""])[0]
+            site_disp = self.site_display(first_site) if first_site else "未知站点"
             del_groups.append({
                 "gid": hashlib.sha1(gk.encode("utf-8", "ignore")).hexdigest()[:12],
                 "name": gname,
                 "site": first_site,
-                "site_name": self.site_display(first_site) if first_site else "未知站点",
+                "site_name": site_disp,
                 "size": max([int(e.get("size") or 0) for e in entries] or [0]),
                 "path": g.get("path", ""),
                 "entries": [{"id": f"{e['dl']}|{e['hash']}",
@@ -803,6 +824,7 @@ class CrossSeedCleaner(_PluginBase):
                              "hash": e["hash"], "name": e.get("name", ""),
                              "size": int(e.get("size") or 0),
                              "uploaded": int(e.get("uploaded") or 0),
+                             "site": first_site, "site_name": site_disp,
                              "magnet": e.get("magnet", ""),
                              "save_path": e.get("save_path", ""),
                              "data_id": e.get("data_id", "")} for e in entries],
@@ -836,12 +858,15 @@ class CrossSeedCleaner(_PluginBase):
                     f"独苗组{stat.get('del_groups', 0)}（涉及{stat.get('del_seeds', 0)}种子）保护命中{stat.get('protected', 0)}")
         if self._auto_delete and result.get("groups"):
             entries = [e for g in result["groups"] for e in g["entries"]]
-            ok, kept = self._delete_entries(entries)
+            ok, kept, site_stats = self._delete_entries(entries)
+            total_freed = sum(s.get("freed", 0) for s in site_stats.values())
             logger.info(f"跨站做种清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
             if self._notify:
                 self._send_notification(
                     f"{self._notify_title_prefix}: 跨站做种清理-自动清理 {ok}/{len(entries)} 个种子"
-                    f"（释放约 {self._fmt_size(stat.get('del_size', 0))}）")
+                    f"（释放约 {self._fmt_size(total_freed)}）"
+                    + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
+                    + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         elif self._notify and result.get("groups"):
             site_stat = stat.get("site_stat") or {}
             site_line = " / ".join(f"{k}:{v}" for k, v in
@@ -922,10 +947,11 @@ class CrossSeedCleaner(_PluginBase):
 
     # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
 
-    def _delete_entries(self, entries: List[Dict]) -> Tuple[int, List[str]]:
+    def _delete_entries(self, entries: List[Dict]) -> Tuple[int, List[str], Dict[str, Dict[str, int]]]:
         """
         按下载器分组删除；删除数据文件前检查数据是否被「本次删除范围之外」的种子引用，
-        被引用则该种子降级为仅删任务。返回 (成功数, 数据保留提示列表)
+        被引用则该种子降级为仅删任务。
+        返回 (成功数, 数据保留提示列表, 站点维度统计 {站点名: {count/freed/torrent_only}})
         """
         by_dl: Dict[str, List[Dict]] = {}
         for e in entries:
@@ -934,6 +960,7 @@ class CrossSeedCleaner(_PluginBase):
                 by_dl.setdefault(dl, []).append(e)
         ok = 0
         kept: List[str] = []
+        site_stats: Dict[str, Dict[str, int]] = {}
         del_ids = {e.get("id") for e in entries}
         for dl, items in by_dl.items():
             inst, dtype = self._get_downloader(dl)
@@ -954,12 +981,14 @@ class CrossSeedCleaner(_PluginBase):
             # 本下载器中本次要删的 hash 集合（用于排除组内互引）
             del_hashes = {(e.get("hash") or "").split("@")[0] for e in entries if e.get("downloader") == dl}
             groups: Dict[bool, List[str]] = {False: [], True: []}
+            entry_meta: Dict[str, Dict[str, Any]] = {}
             for it in items:
                 h = it.get("hash") or ""
                 h_plain = h.split("@")[0]
                 if h_plain not in all_ids:
                     logger.warning(f"跨站做种清理：种子 {h_plain} 已不在下载器 {dl}，跳过")
                     continue
+                meta_sname = it.get("site_name") or it.get("site") or "未知站点"
                 data_id = all_ids.get(h_plain) or ""
                 referenced = False
                 if self._delete_file:
@@ -973,8 +1002,10 @@ class CrossSeedCleaner(_PluginBase):
                 if referenced:
                     kept.append(it.get("name") or h_plain)
                     groups[False].append(h_plain)
+                    entry_meta[h_plain] = {"site_name": meta_sname, "size": 0}
                 else:
                     groups[bool(self._delete_file)].append(h_plain)
+                    entry_meta[h_plain] = {"site_name": meta_sname, "size": int(it.get("size") or 0)}
             for delete_file, hashes in groups.items():
                 if not hashes:
                     continue
@@ -982,6 +1013,16 @@ class CrossSeedCleaner(_PluginBase):
                 try:
                     if inst.delete_torrents(delete_file=delete_file, ids=hashes):
                         ok += len(hashes)
+                        # 站点维度统计（成功删除的才计入）
+                        for hh in hashes:
+                            meta = entry_meta.get(hh) or {}
+                            sname = meta.get("site_name") or "未知站点"
+                            st = site_stats.setdefault(sname, {"count": 0, "freed": 0, "torrent_only": 0})
+                            st["count"] += 1
+                            if delete_file:
+                                st["freed"] += int(meta.get("size") or 0)
+                            else:
+                                st["torrent_only"] += 1
                     else:
                         logger.error(f"跨站做种清理：{dl} 删除失败（delete_file={delete_file}）")
                 except Exception as e:
@@ -1001,7 +1042,7 @@ class CrossSeedCleaner(_PluginBase):
         except Exception as e:
             logger.warning(f"跨站做种清理：更新结果缓存失败：{e}")
         self._sel = [s for s in self._sel if s not in del_ids]
-        return ok, kept
+        return ok, kept, site_stats
 
     # ==================== 回收站（误删恢复） ====================
 
@@ -1193,7 +1234,7 @@ class CrossSeedCleaner(_PluginBase):
                 break
         if not target:
             return {"success": False, "message": "条目不存在，请重新扫描"}
-        ok, _ = self._delete_entries([target])
+        ok, _, _ = self._delete_entries([target])
         return {"success": ok > 0, "message": f"已删除 {ok} 个" if ok else "删除失败"}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
@@ -1209,11 +1250,15 @@ class CrossSeedCleaner(_PluginBase):
         targets = [e for g in groups for e in g.get("entries", []) if e.get("id") in selected]
         if not targets:
             return {"success": False, "message": "勾选条目不在结果中，请重新扫描"}
-        ok, kept = self._delete_entries(targets)
+        ok, kept, site_stats = self._delete_entries(targets)
+        total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站做种清理：删除勾选完成 {ok}/{len(targets)}")
         if self._notify and ok:
-            self._send_notification(f"{self._notify_title_prefix}: 跨站做种清理-删除勾选 {ok}/{len(targets)} 个种子"
-                                    + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else ""))
+            self._send_notification(
+                f"{self._notify_title_prefix}: 跨站做种清理-删除勾选 {ok}/{len(targets)} 个种子"
+                f"（释放约 {self._fmt_size(total_freed)}）"
+                + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
+                + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         return {"success": True, "ok": ok, "total": len(targets)}
 
     def delete_all_api(self, confirm: str = "") -> Dict[str, Any]:
@@ -1226,11 +1271,15 @@ class CrossSeedCleaner(_PluginBase):
         targets = [e for g in groups for e in g.get("entries", [])]
         if not targets:
             return {"success": False, "message": "当前无结果"}
-        ok, kept = self._delete_entries(targets)
+        ok, kept, site_stats = self._delete_entries(targets)
+        total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站做种清理：全部删除完成 {ok}/{len(targets)}")
         if self._notify and ok:
-            self._send_notification(f"{self._notify_title_prefix}: 跨站做种清理-删除全部独苗 {ok}/{len(targets)} 个种子"
-                                    + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else ""))
+            self._send_notification(
+                f"{self._notify_title_prefix}: 跨站做种清理-删除全部独苗 {ok}/{len(targets)} 个种子"
+                f"（释放约 {self._fmt_size(total_freed)}）"
+                + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
+                + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         return {"success": True, "ok": ok, "total": len(targets)}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
