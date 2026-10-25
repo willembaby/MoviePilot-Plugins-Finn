@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-跨站做种清理插件 (CrossSeedCleaner)
+跨站独苗种子清理插件 (CrossSeedCleaner)
 
 功能：
 - 扫描 MoviePilot 已配置下载器 + 自定义下载器（qBittorrent / Transmission）中的全部种子
@@ -93,16 +93,16 @@ def analyze_items(items: dict, group_by: str = "name") -> dict:
 
 class CrossSeedCleaner(_PluginBase):
     """
-    跨站做种清理插件
+    跨站独苗种子清理插件
     """
 
-    plugin_name = "跨站做种清理"
+    plugin_name = "跨站独苗种子清理"
     plugin_desc = ("按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数："
                    "仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；"
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -187,7 +187,11 @@ class CrossSeedCleaner(_PluginBase):
             if self._group_by not in ("name", "path"):
                 self._group_by = "name"
             self._skip_active = bool(config.get("skip_active", True))
-            self._protected_sites = config.get("protected_sites", "") or ""
+            pv = config.get("protected_sites", "")
+            if isinstance(pv, list):
+                self._protected_sites = ",".join(str(x).strip() for x in pv if str(x).strip())
+            else:
+                self._protected_sites = str(pv or "")
             self._protected_keywords = config.get("protected_keywords", "") or ""
             try:
                 self._protect_uploaded_gb = float(config.get("protect_uploaded_gb") or 0)
@@ -205,19 +209,19 @@ class CrossSeedCleaner(_PluginBase):
                 self._scheduler.add_job(
                     func=self._schedule_scan,
                     trigger=CronTrigger.from_crontab(self._cron),
-                    name="跨站做种清理",
+                    name="跨站独苗种子清理",
                 )
-                logger.info(f"跨站做种清理定时任务注册成功：cron={self._cron}")
+                logger.info(f"跨站独苗种子清理定时任务注册成功：cron={self._cron}")
             except Exception as e:
-                logger.error(f"跨站做种清理定时任务注册失败：{e}")
+                logger.error(f"跨站独苗种子清理定时任务注册失败：{e}")
 
             if self._onlyonce:
-                logger.info("跨站做种清理服务启动，立即运行一次")
+                logger.info("跨站独苗种子清理服务启动，立即运行一次")
                 self._scheduler.add_job(
                     func=self._schedule_scan,
                     trigger="date",
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=5),
-                    name="跨站做种清理-立即运行",
+                    name="跨站独苗种子清理-立即运行",
                 )
                 self._onlyonce = False
                 self.__update_config()
@@ -248,6 +252,11 @@ class CrossSeedCleaner(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        # 保护站点多选下拉选项：优先读 MoviePilot 站点管理的站点名，无站点时回退内置表
+        site_names = sorted({n for n in self._site_name_map().values() if n})
+        if not site_names:
+            site_names = sorted(set(self.BUILTIN_SITE_MAP.values()))
+        site_items = [{'title': n, 'value': n} for n in site_names]
         return [
             {
                 'component': 'VForm',
@@ -299,7 +308,7 @@ class CrossSeedCleaner(_PluginBase):
                         'component': 'VRow',
                         'content': [
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
-                             'content': [{'component': 'VTextField', 'props': {'model': 'protected_sites', 'label': '保护站点（逗号分隔，独苗站点命中不删）', 'placeholder': '馒头M-Team,HD影Sky'}}]},
+                             'content': [{'component': 'VSelect', 'props': {'model': 'protected_sites', 'label': '保护站点（多选，选项读自站点管理；独苗站点命中不删）', 'multiple': True, 'chips': True, 'closableChips': True, 'clearable': True, 'items': site_items}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [{'component': 'VTextField', 'props': {'model': 'notify_title_prefix', 'label': '通知前缀', 'placeholder': 'HA通知'}}]},
                         ]
@@ -338,7 +347,7 @@ class CrossSeedCleaner(_PluginBase):
             "notify_title_prefix": "HA通知",
             "group_by": "name",
             "skip_active": True,
-            "protected_sites": "",
+            "protected_sites": [],
             "protected_keywords": "",
             "protect_uploaded_gb": 0,
             "recycle_enabled": True,
@@ -527,14 +536,14 @@ class CrossSeedCleaner(_PluginBase):
         return "\n".join(lines)
 
     def site_display(self, key: str) -> str:
-        """站点主域 key -> 展示名"""
+        """站点主域 key -> 展示名（MP 站点管理优先，全域名/主域双向后缀匹配，再回退内置表）"""
         if not key:
             return ""
         m = self._site_name_map()
         if key in m:
             return m[key]
         for d, n in m.items():
-            if key == d or key.endswith("." + d):
+            if d == key or d.endswith("." + key) or key.endswith("." + d):
                 return n
         if key in self.BUILTIN_SITE_MAP:
             return self.BUILTIN_SITE_MAP[key]
@@ -554,29 +563,36 @@ class CrossSeedCleaner(_PluginBase):
                     h = host_of(domain) if "://" in domain else domain.split("/")[0]
                     if h:
                         m[h] = name
+                        parts = [p for p in h.split(".") if p]
+                        if len(parts) >= 2:
+                            # 同时注册主域 key（tracker 侧取的是主域），确保能直接命中
+                            m.setdefault(parts[-2] + "." + parts[-1], name)
         except Exception as e:
-            logger.warning(f"跨站做种清理：读取站点列表失败：{e}")
+            logger.warning(f"跨站独苗种子清理：读取站点列表失败：{e}")
         self._site_map_cache = m
         return m
 
     def _protected_site_list(self) -> List[str]:
-        return [s.strip().lower() for s in (self._protected_sites or "").replace("，", ",").split(",") if s.strip()]
+        """保护站点配置（兼容多选下拉的 list 与逗号分隔字符串，保留原大写）"""
+        v = self._protected_sites
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return [s.strip() for s in str(v or "").replace("，", ",").split(",") if s.strip()]
 
     def _keyword_list(self) -> List[str]:
         return [k.strip() for k in (self._protected_keywords or "").splitlines() if k.strip()]
 
     def _site_protected(self, site_keys: set) -> bool:
-        if not site_keys:
-            return False
         plist = self._protected_site_list()
-        if not plist:
+        if not plist or not site_keys:
             return False
+        pset = {p.lower() for p in plist}
         for k in site_keys:
-            disp = self.site_display(k)
-            disp_low = (disp or "").lower()
-            for p in plist:
-                if p == k or p == k.split(".")[0] or (disp_low and disp_low == p) \
-                        or (disp_low and p in disp_low):
+            disp_low = (self.site_display(k) or "").lower()
+            k_low = (k or "").lower()
+            for p in pset:
+                if p == k_low or p == k_low.split(".")[0] \
+                        or (disp_low and (p == disp_low or p in disp_low)):
                     return True
         return False
 
@@ -608,7 +624,7 @@ class CrossSeedCleaner(_PluginBase):
                 return Transmission(host=host, port=int(port) if port else None,
                                     username=user or None, password=pwd or None)
         except Exception as e:
-            logger.error(f"跨站做种清理：构建自定义下载器失败 {dtype} {host}:{port}：{e}")
+            logger.error(f"跨站独苗种子清理：构建自定义下载器失败 {dtype} {host}:{port}：{e}")
         return None
 
     def _iter_downloaders(self):
@@ -621,7 +637,7 @@ class CrossSeedCleaner(_PluginBase):
                     continue
                 yield name, dtype, inst
         except Exception as e:
-            logger.error(f"跨站做种清理：获取 MoviePilot 下载器失败：{e}")
+            logger.error(f"跨站独苗种子清理：获取 MoviePilot 下载器失败：{e}")
         for idx, cfg in enumerate(self._parse_custom()):
             dtype, host, port, user, pwd = cfg
             inst = self._build_custom(dtype, host, port, user, pwd)
@@ -645,7 +661,7 @@ class CrossSeedCleaner(_PluginBase):
             if info and getattr(info, "instance", None):
                 return info.instance, str(getattr(info, "type", "") or "").lower()
         except Exception as e:
-            logger.error(f"跨站做种清理：获取下载器 {dl} 失败：{e}")
+            logger.error(f"跨站独苗种子清理：获取下载器 {dl} 失败：{e}")
         return None, ""
 
     # ==================== 种子抓取（TR 直连 RPC / QB 并发） ====================
@@ -667,7 +683,7 @@ class CrossSeedCleaner(_PluginBase):
             r1 = sess.post(url, data={}, auth=(user, pwd), timeout=20)
             sid = r1.headers.get("X-Transmission-Session-Id")
             if not sid:
-                logger.error("跨站做种清理：TR 会话握手失败（未返回 Session-Id）")
+                logger.error("跨站独苗种子清理：TR 会话握手失败（未返回 Session-Id）")
                 return out
             r = sess.post(url, headers={"X-Transmission-Session-Id": sid}, auth=(user, pwd),
                           json={"method": "torrent-get",
@@ -699,7 +715,7 @@ class CrossSeedCleaner(_PluginBase):
                     "data_id": content,
                 }
         except Exception as e:
-            logger.error(f"跨站做种清理：TR RPC 拉取种子失败：{e}")
+            logger.error(f"跨站独苗种子清理：TR RPC 拉取种子失败：{e}")
         return out
 
     def _qb_fetch_all(self, inst: Any, dl_name: str) -> Dict[str, dict]:
@@ -711,7 +727,7 @@ class CrossSeedCleaner(_PluginBase):
         try:
             infos = list(qbc.torrents_info() or [])
         except Exception as e:
-            logger.error(f"跨站做种清理：QB 拉取种子列表失败：{e}")
+            logger.error(f"跨站独苗种子清理：QB 拉取种子列表失败：{e}")
             return out
 
         def _trackers(h: str) -> List[str]:
@@ -775,7 +791,7 @@ class CrossSeedCleaner(_PluginBase):
                     d = self._qb_fetch_all(inst, name)
                 else:
                     d = {}
-                logger.info(f"跨站做种清理：下载器 {name}（{dtype}）共抓取 {len(d)} 个种子")
+                logger.info(f"跨站独苗种子清理：下载器 {name}（{dtype}）共抓取 {len(d)} 个种子")
                 for h, it in d.items():
                     if h in items:
                         k = f"{h}@{name}"
@@ -783,7 +799,7 @@ class CrossSeedCleaner(_PluginBase):
                     else:
                         items[h] = it
             except Exception as e:
-                logger.error(f"跨站做种清理：下载器 {name} 处理异常：{e}")
+                logger.error(f"跨站独苗种子清理：下载器 {name} 处理异常：{e}")
 
         analyzed = analyze_items(items, self._group_by)
         groups = analyzed["groups"]
@@ -854,16 +870,16 @@ class CrossSeedCleaner(_PluginBase):
         items, result = self._scan_all()
         self.save_data("result", result)
         stat = result.get("stat") or {}
-        logger.info(f"跨站做种清理：分析完成 种子{stat.get('total', 0)} 多站保留组{stat.get('keep_groups', 0)} "
+        logger.info(f"跨站独苗种子清理：分析完成 种子{stat.get('total', 0)} 多站保留组{stat.get('keep_groups', 0)} "
                     f"独苗组{stat.get('del_groups', 0)}（涉及{stat.get('del_seeds', 0)}种子）保护命中{stat.get('protected', 0)}")
         if self._auto_delete and result.get("groups"):
             entries = [e for g in result["groups"] for e in g["entries"]]
             ok, kept, site_stats = self._delete_entries(entries)
             total_freed = sum(s.get("freed", 0) for s in site_stats.values())
-            logger.info(f"跨站做种清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
+            logger.info(f"跨站独苗种子清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
             if self._notify:
                 self._send_notification(
-                    f"{self._notify_title_prefix}: 跨站做种清理-自动清理 {ok}/{len(entries)} 个种子"
+                    f"{self._notify_title_prefix}: 跨站独苗种子清理-自动清理 {ok}/{len(entries)} 个种子"
                     f"（释放约 {self._fmt_size(total_freed)}）"
                     + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
                     + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
@@ -872,7 +888,7 @@ class CrossSeedCleaner(_PluginBase):
             site_line = " / ".join(f"{k}:{v}" for k, v in
                                    sorted(site_stat.items(), key=lambda x: -x[1])[:8])
             self._send_notification(
-                f"{self._notify_title_prefix}: 跨站做种清理-发现 {stat.get('del_groups', 0)} 组独苗"
+                f"{self._notify_title_prefix}: 跨站独苗种子清理-发现 {stat.get('del_groups', 0)} 组独苗"
                 f"（{stat.get('del_seeds', 0)} 个种子 / {self._fmt_size(stat.get('del_size', 0))}）\n"
                 f"多站保留 {stat.get('keep_groups', 0)} 组，保护命中 {stat.get('protected', 0)} 组\n"
                 f"站点分布：{site_line or '-'}\n请到插件页面查看并删除")
@@ -880,14 +896,14 @@ class CrossSeedCleaner(_PluginBase):
     def scan_api(self) -> Dict[str, Any]:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
-        logger.info("跨站做种清理：开始扫描分析...")
+        logger.info("跨站独苗种子清理：开始扫描分析...")
         items, result = self._scan_all()
         self.save_data("result", result)
         self._sel = []
         stat = result.get("stat") or {}
-        logger.info(f"跨站做种清理：扫描完成 {stat}")
+        logger.info(f"跨站独苗种子清理：扫描完成 {stat}")
         if self._notify and result.get("groups"):
-            self._send_notification(f"{self._notify_title_prefix}: 跨站做种清理-扫描完成，"
+            self._send_notification(f"{self._notify_title_prefix}: 跨站独苗种子清理-扫描完成，"
                                     f"独苗 {stat.get('del_groups', 0)} 组 {stat.get('del_seeds', 0)} 个种子，请到插件页面查看")
         return {"success": True, "stat": stat}
 
@@ -965,7 +981,7 @@ class CrossSeedCleaner(_PluginBase):
         for dl, items in by_dl.items():
             inst, dtype = self._get_downloader(dl)
             if not inst:
-                logger.error(f"跨站做种清理：下载器 {dl} 不可用，跳过")
+                logger.error(f"跨站独苗种子清理：下载器 {dl} 不可用，跳过")
                 continue
             # 重新拉取全量种子（组外引用判断 + 存在性校验）
             try:
@@ -976,7 +992,7 @@ class CrossSeedCleaner(_PluginBase):
                 else:
                     all_ids = {}
             except Exception as e:
-                logger.error(f"跨站做种清理：获取 {dl} 全量种子失败，跳过该下载器：{e}")
+                logger.error(f"跨站独苗种子清理：获取 {dl} 全量种子失败，跳过该下载器：{e}")
                 continue
             # 本下载器中本次要删的 hash 集合（用于排除组内互引）
             del_hashes = {(e.get("hash") or "").split("@")[0] for e in entries if e.get("downloader") == dl}
@@ -986,7 +1002,7 @@ class CrossSeedCleaner(_PluginBase):
                 h = it.get("hash") or ""
                 h_plain = h.split("@")[0]
                 if h_plain not in all_ids:
-                    logger.warning(f"跨站做种清理：种子 {h_plain} 已不在下载器 {dl}，跳过")
+                    logger.warning(f"跨站独苗种子清理：种子 {h_plain} 已不在下载器 {dl}，跳过")
                     continue
                 meta_sname = it.get("site_name") or it.get("site") or "未知站点"
                 data_id = all_ids.get(h_plain) or ""
@@ -1024,9 +1040,9 @@ class CrossSeedCleaner(_PluginBase):
                             else:
                                 st["torrent_only"] += 1
                     else:
-                        logger.error(f"跨站做种清理：{dl} 删除失败（delete_file={delete_file}）")
+                        logger.error(f"跨站独苗种子清理：{dl} 删除失败（delete_file={delete_file}）")
                 except Exception as e:
-                    logger.error(f"跨站做种清理：{dl} 删除种子异常：{e}")
+                    logger.error(f"跨站独苗种子清理：{dl} 删除种子异常：{e}")
         # 更新结果缓存
         try:
             saved = self.get_data("result") or {}
@@ -1040,7 +1056,7 @@ class CrossSeedCleaner(_PluginBase):
             saved["stat"] = stat
             self.save_data("result", saved)
         except Exception as e:
-            logger.warning(f"跨站做种清理：更新结果缓存失败：{e}")
+            logger.warning(f"跨站独苗种子清理：更新结果缓存失败：{e}")
         self._sel = [s for s in self._sel if s not in del_ids]
         return ok, kept, site_stats
 
@@ -1091,18 +1107,18 @@ class CrossSeedCleaner(_PluginBase):
                                 f.write(content)
                             bk_type, bk_file = "torrent", fn
                 except Exception as e:
-                    logger.warning(f"跨站做种清理：导出种子文件失败（{str(it.get('name', ''))[:30]}）：{e}")
+                    logger.warning(f"跨站独苗种子清理：导出种子文件失败（{str(it.get('name', ''))[:30]}）：{e}")
             if not bk_type and it.get("magnet"):
                 bk_type, bk_magnet = "magnet", str(it["magnet"])
             if not bk_type:
-                logger.warning(f"跨站做种清理：该种子无可用备份材料（{str(it.get('name', ''))[:40]}）")
+                logger.warning(f"跨站独苗种子清理：该种子无可用备份材料（{str(it.get('name', ''))[:40]}）")
                 continue
             rec[key] = {
                 "downloader": dl,
                 "dl_type": dtype or "",
                 "hash": h_plain,
                 "name": it.get("name", ""),
-                "site": it.get("site", ""),
+                "site": it.get("site_name") or it.get("site", ""),
                 "size": it.get("size", 0) or 0,
                 "uploaded": it.get("uploaded", 0) or 0,
                 "save_path": it.get("save_path", ""),
@@ -1175,7 +1191,7 @@ class CrossSeedCleaner(_PluginBase):
                 os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
             except Exception:
                 pass
-        logger.info(f"跨站做种清理：已恢复种子 {str(item.get('name', ''))[:40]}")
+        logger.info(f"跨站独苗种子清理：已恢复种子 {str(item.get('name', ''))[:40]}")
         return {"success": True, "message": "恢复成功：已重新添加并校验数据"
                 + ("（原数据已删，将重新下载）" if item.get("deleted_file") else "")}
 
@@ -1252,10 +1268,10 @@ class CrossSeedCleaner(_PluginBase):
             return {"success": False, "message": "勾选条目不在结果中，请重新扫描"}
         ok, kept, site_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
-        logger.info(f"跨站做种清理：删除勾选完成 {ok}/{len(targets)}")
+        logger.info(f"跨站独苗种子清理：删除勾选完成 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(
-                f"{self._notify_title_prefix}: 跨站做种清理-删除勾选 {ok}/{len(targets)} 个种子"
+                f"{self._notify_title_prefix}: 跨站独苗种子清理-删除勾选 {ok}/{len(targets)} 个种子"
                 f"（释放约 {self._fmt_size(total_freed)}）"
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
@@ -1273,10 +1289,10 @@ class CrossSeedCleaner(_PluginBase):
             return {"success": False, "message": "当前无结果"}
         ok, kept, site_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
-        logger.info(f"跨站做种清理：全部删除完成 {ok}/{len(targets)}")
+        logger.info(f"跨站独苗种子清理：全部删除完成 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(
-                f"{self._notify_title_prefix}: 跨站做种清理-删除全部独苗 {ok}/{len(targets)} 个种子"
+                f"{self._notify_title_prefix}: 跨站独苗种子清理-删除全部独苗 {ok}/{len(targets)} 个种子"
                 f"（释放约 {self._fmt_size(total_freed)}）"
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
@@ -1316,7 +1332,7 @@ class CrossSeedCleaner(_PluginBase):
             "notify_title_prefix": self._notify_title_prefix,
             "group_by": self._group_by,
             "skip_active": self._skip_active,
-            "protected_sites": self._protected_sites,
+            "protected_sites": self._protected_site_list(),
             "protected_keywords": self._protected_keywords,
             "protect_uploaded_gb": self._protect_uploaded_gb,
             "recycle_enabled": self._recycle_enabled,
@@ -1329,10 +1345,10 @@ class CrossSeedCleaner(_PluginBase):
                 resp = requests.post(self._webhook,
                                      json={"msg_type": "text", "content": {"text": text}}, timeout=15)
                 if resp.status_code == 200 and resp.json().get("code") == 0:
-                    logger.info("跨站做种清理飞书通知发送成功")
+                    logger.info("跨站独苗种子清理飞书通知发送成功")
                     return
                 else:
-                    logger.error(f"跨站做种清理飞书通知发送失败：{resp.text[:200]}")
+                    logger.error(f"跨站独苗种子清理飞书通知发送失败：{resp.text[:200]}")
             except Exception as e:
-                logger.error(f"跨站做种清理飞书通知发送异常：{e}")
-        self.post_message(title="跨站做种清理", text=text)
+                logger.error(f"跨站独苗种子清理飞书通知发送异常：{e}")
+        self.post_message(title="跨站独苗种子清理", text=text)
