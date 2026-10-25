@@ -102,7 +102,7 @@ class CrossSeedCleaner(_PluginBase):
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -122,7 +122,7 @@ class CrossSeedCleaner(_PluginBase):
     _skip_active = True           # 含未完成种子的独苗组跳过（不删）
     _protected_sites = ""         # 保护站点（逗号分隔站点名/域名，独苗站点命中则保留）
     _protected_keywords = ""      # 保护关键词（每行一个，种子名命中则整组保留）
-    _protect_uploaded_gb = 0      # 累计上传量保护阈值 GB（0=不启用）
+    _protect_uploaded_gb = 0      # 累计上传量保护阈值 GB（0 同样生效：仅清理从未上传过的种子）
     _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _scheduler = None
@@ -174,6 +174,7 @@ class CrossSeedCleaner(_PluginBase):
     # ==================== 生命周期 ====================
 
     def init_plugin(self, config: dict = None):
+        legacy_pv = False  # 旧版 protected_sites 为文本字符串（含空串）→ 需迁移为列表存储
         if config:
             self._enabled = config.get("enabled", False)
             self._onlyonce = config.get("onlyonce", False) or False
@@ -191,7 +192,9 @@ class CrossSeedCleaner(_PluginBase):
             if isinstance(pv, list):
                 self._protected_sites = ",".join(str(x).strip() for x in pv if str(x).strip())
             else:
-                self._protected_sites = str(pv or "")
+                # 旧版字符串格式（含空串，前端多选框会渲染成异常空标签）→ 归一化并回写为列表
+                self._protected_sites = str(pv or "").strip()
+                legacy_pv = True
             self._protected_keywords = config.get("protected_keywords", "") or ""
             try:
                 self._protect_uploaded_gb = float(config.get("protect_uploaded_gb") or 0)
@@ -200,6 +203,10 @@ class CrossSeedCleaner(_PluginBase):
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
             self._custom_downloaders = config.get("custom_downloaders") or ""
         self._sel = []
+
+        if legacy_pv:
+            # 一次性迁移：把旧字符串格式（含空串）写回为纯净空列表，消除配置页空白 chip
+            self.__update_config()
 
         self.__stop_service()
 
@@ -301,7 +308,7 @@ class CrossSeedCleaner(_PluginBase):
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VTextField', 'props': {'model': 'cron', 'label': '执行周期(Cron)', 'placeholder': '0 4 * * *（每天4点）'}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                             'content': [{'component': 'VTextField', 'props': {'model': 'protect_uploaded_gb', 'label': '累计上传保护阈值GB(0=关)', 'placeholder': '0'}}]},
+                              'content': [{'component': 'VTextField', 'props': {'model': 'protect_uploaded_gb', 'label': '累计上传保护阈值GB（组内累计上传≥阈值整组保留；0=仅清理从未上传过的种子）', 'placeholder': '0'}}]},
                         ]
                     },
                     {
@@ -582,6 +589,17 @@ class CrossSeedCleaner(_PluginBase):
     def _keyword_list(self) -> List[str]:
         return [k.strip() for k in (self._protected_keywords or "").splitlines() if k.strip()]
 
+    def _upload_protected(self, entries: List[Dict]) -> bool:
+        """
+        累计上传量保护（阈值 0 同样是有效判定依据，不作关闭开关）：
+        - 阈值 > 0：组内累计上传 ≥ 阈值(GB) → 整组保留
+        - 阈值 = 0：组内累计上传 > 0（有任意上传量）→ 整组保留，仅清理从未上传过的内容
+        """
+        total_up = sum(int(e.get("uploaded") or 0) for e in entries)
+        if self._protect_uploaded_gb > 0:
+            return total_up >= self._protect_uploaded_gb * 1024 ** 3
+        return total_up > 0
+
     def _site_protected(self, site_keys: set) -> bool:
         plist = self._protected_site_list()
         if not plist or not site_keys:
@@ -821,11 +839,9 @@ class CrossSeedCleaner(_PluginBase):
             if kws and any(k.lower() in gname.lower() for k in kws):
                 protected_n += 1
                 continue
-            if self._protect_uploaded_gb > 0:
-                total_up = sum(int(e.get("uploaded") or 0) for e in entries)
-                if total_up >= self._protect_uploaded_gb * 1024 ** 3:
-                    protected_n += 1
-                    continue
+            if self._upload_protected(entries):
+                protected_n += 1
+                continue
             first_site = (list(site_keys) or [""])[0]
             site_disp = self.site_display(first_site) if first_site else "未知站点"
             del_groups.append({
