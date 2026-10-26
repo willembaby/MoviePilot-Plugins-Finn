@@ -102,7 +102,7 @@ class CrossSeedCleaner(_PluginBase):
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -457,6 +457,10 @@ class CrossSeedCleaner(_PluginBase):
                                      'content': [{'component': 'div', 'props': {'class': 'text-caption'},
                                                   'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
                                                            if e.get('uploaded') else '')}]},
+                                    {'component': 'VCol', 'props': {'cols': 'auto'},
+                                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                                                  'text': (f"最新上传 {self._fmt_date(e.get('upload_time', 0))}"
+                                                           if e.get('upload_time') else '')}]},
                                 ]
                             } for e in g.get("entries", [])
                         ],
@@ -522,6 +526,31 @@ class CrossSeedCleaner(_PluginBase):
             return f"{size / 1024:.0f} KB"
         except Exception:
             return "0 KB"
+
+    @staticmethod
+    def _fmt_date(ts) -> str:
+        """Unix 秒级时间戳 -> YYYY-MM-DD（0/空则返回空串）"""
+        try:
+            ts = float(ts or 0)
+            if ts <= 0:
+                return ""
+            return datetime.fromtimestamp(ts, tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _qb_ts(v) -> int:
+        """qBittorrent last_activity 归一化为 Unix 秒时间戳：
+        qB 该字段存在两种语义——大值(>1e9)为时间戳直接用；小值为「距今秒数」需用 now 减去。"""
+        try:
+            v = float(v or 0)
+        except Exception:
+            return 0
+        if v <= 0:
+            return 0
+        if v > 1000000000:
+            return int(v)
+        return int(time.time() - v)
 
     @staticmethod
     def _fmt_site_stats(site_stats: Dict[str, Dict[str, int]]) -> str:
@@ -708,7 +737,7 @@ class CrossSeedCleaner(_PluginBase):
                                 "arguments": {"fields": [
                                     "hashString", "name", "totalSize", "percentDone", "status",
                                     "downloadDir", "contentPath", "uploadedEver",
-                                    "trackers", "magnetLink"]}},
+                                    "activityDate", "trackers", "magnetLink"]}},
                           timeout=120)
             for t in r.json().get("arguments", {}).get("torrents", []):
                 h = t.get("hashString")
@@ -726,6 +755,7 @@ class CrossSeedCleaner(_PluginBase):
                     "name": str(t.get("name") or ""),
                     "size": int(t.get("totalSize") or 0),
                     "uploaded": int(t.get("uploadedEver") or 0),
+                    "upload_time": int(t.get("activityDate") or 0),
                     "sites": sites,
                     "active": active,
                     "magnet": str(t.get("magnetLink") or ""),
@@ -787,6 +817,7 @@ class CrossSeedCleaner(_PluginBase):
                 "name": str(x.get("name") or ""),
                 "size": int(x.get("size") or 0),
                 "uploaded": int(x.get("total_uploaded") or x.get("uploaded") or 0),
+                "upload_time": self._qb_ts(x.get("last_activity")),
                 "sites": sites,
                 "active": active,
                 "magnet": str(x.get("magnet_uri") or ""),
@@ -856,6 +887,7 @@ class CrossSeedCleaner(_PluginBase):
                              "hash": e["hash"], "name": e.get("name", ""),
                              "size": int(e.get("size") or 0),
                              "uploaded": int(e.get("uploaded") or 0),
+                             "upload_time": int(e.get("upload_time") or 0),
                              "site": first_site, "site_name": site_disp,
                              "magnet": e.get("magnet", ""),
                              "save_path": e.get("save_path", ""),
