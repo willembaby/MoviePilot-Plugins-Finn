@@ -10,6 +10,7 @@
 - 保护规则：未完成种子跳过、保护站点白名单、保护关键词、累计上传量阈值
 - 删除前自动备份种子到回收站（qB 导出 .torrent / TR 记录磁力链），支持一键恢复
 - 数据文件辅种保护：数据仍被本次删除范围之外的种子引用时自动降级为仅删任务
+- 整理联动：删除数据文件时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护）
 - 定时扫描（可配自动清理）+ 页面手动触发，飞书 Webhook 或系统消息通知
 """
 
@@ -100,10 +101,11 @@ class CrossSeedCleaner(_PluginBase):
     plugin_desc = ("按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数："
                    "仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；"
                    "条目带站点名与最新上传日期，结果可按最新上传时间排序；"
+                   "删数据时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护）；"
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -125,6 +127,7 @@ class CrossSeedCleaner(_PluginBase):
     _protected_keywords = ""      # 保护关键词（每行一个，种子名命中则整组保留）
     _protect_uploaded_gb = 0      # 累计上传量保护阈值 GB（0 同样生效：仅清理从未上传过的种子）
     _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
+    _clean_media_links = True     # 删数据时同步清理媒体库硬链接文件与转移记录
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _scheduler = None
     _sel: List[str] = []
@@ -203,6 +206,7 @@ class CrossSeedCleaner(_PluginBase):
             except Exception:
                 self._protect_uploaded_gb = 0
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
+            self._clean_media_links = bool(config.get("clean_media_links", True))
             self._custom_downloaders = config.get("custom_downloaders") or ""
         self._sel = []
         self._sort_order = "asc"
@@ -286,9 +290,11 @@ class CrossSeedCleaner(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'delete_file', 'label': '允许删除数据文件（独苗清理释放空间的核心）'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'clean_media_links', 'label': '同步清理媒体库硬链接与转移记录（仅对删了数据的种子生效）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'auto_delete', 'label': '定时扫描后自动清理（不勾选则仅分析通知）'}}]},
                         ]
                     },
@@ -362,6 +368,7 @@ class CrossSeedCleaner(_PluginBase):
             "protected_keywords": "",
             "protect_uploaded_gb": 0,
             "recycle_enabled": True,
+            "clean_media_links": True,
             "custom_downloaders": "",
         }
 
@@ -561,6 +568,21 @@ class CrossSeedCleaner(_PluginBase):
             return f"{size / 1024:.0f} KB"
         except Exception:
             return "0 KB"
+
+    @staticmethod
+    def _transfer_stats_text(t_stats: Dict[str, int]) -> str:
+        """整理联动统计 -> 通知文本片段"""
+        if not t_stats:
+            return ""
+        records = t_stats.get("records", 0)
+        files = t_stats.get("files", 0)
+        skipped = t_stats.get("skipped", 0)
+        if not records and not files:
+            return ""
+        part = f"，整理联动：清转移记录 {records} 条/删媒体文件 {files} 个"
+        if skipped:
+            part += f"（{skipped} 个文件因共享引用或仍有硬链接未删，仅清记录）"
+        return part
 
     @staticmethod
     def _fmt_date(ts) -> str:
@@ -957,13 +979,14 @@ class CrossSeedCleaner(_PluginBase):
                     f"独苗组{stat.get('del_groups', 0)}（涉及{stat.get('del_seeds', 0)}种子）保护命中{stat.get('protected', 0)}")
         if self._auto_delete and result.get("groups"):
             entries = [e for g in result["groups"] for e in g["entries"]]
-            ok, kept, site_stats = self._delete_entries(entries)
+            ok, kept, site_stats, t_stats = self._delete_entries(entries)
             total_freed = sum(s.get("freed", 0) for s in site_stats.values())
             logger.info(f"跨站独苗种子清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
             if self._notify:
                 self._send_notification(
                     f"{self._notify_title_prefix}: 跨站独苗种子清理-自动清理 {ok}/{len(entries)} 个种子"
                     f"（释放约 {self._fmt_size(total_freed)}）"
+                    + self._transfer_stats_text(t_stats)
                     + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
                     + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         elif self._notify and result.get("groups"):
@@ -1052,11 +1075,11 @@ class CrossSeedCleaner(_PluginBase):
 
     # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
 
-    def _delete_entries(self, entries: List[Dict]) -> Tuple[int, List[str], Dict[str, Dict[str, int]]]:
+    def _delete_entries(self, entries: List[Dict]) -> Tuple[int, List[str], Dict[str, Dict[str, int]], Dict[str, int]]:
         """
         按下载器分组删除；删除数据文件前检查数据是否被「本次删除范围之外」的种子引用，
-        被引用则该种子降级为仅删任务。
-        返回 (成功数, 数据保留提示列表, 站点维度统计 {站点名: {count/freed/torrent_only}})
+        被引用则该种子降级为仅删任务；删数据的种子同步清理媒体库硬链接与转移记录。
+        返回 (成功数, 数据保留提示列表, 站点维度统计, 整理联动统计 {records/files/skipped})
         """
         by_dl: Dict[str, List[Dict]] = {}
         for e in entries:
@@ -1066,6 +1089,7 @@ class CrossSeedCleaner(_PluginBase):
         ok = 0
         kept: List[str] = []
         site_stats: Dict[str, Dict[str, int]] = {}
+        del_data_hashes: List[str] = []
         del_ids = {e.get("id") for e in entries}
         for dl, items in by_dl.items():
             inst, dtype = self._get_downloader(dl)
@@ -1118,6 +1142,8 @@ class CrossSeedCleaner(_PluginBase):
                 try:
                     if inst.delete_torrents(delete_file=delete_file, ids=hashes):
                         ok += len(hashes)
+                        if delete_file:
+                            del_data_hashes.extend(hashes)
                         # 站点维度统计（成功删除的才计入）
                         for hh in hashes:
                             meta = entry_meta.get(hh) or {}
@@ -1147,7 +1173,106 @@ class CrossSeedCleaner(_PluginBase):
         except Exception as e:
             logger.warning(f"跨站独苗种子清理：更新结果缓存失败：{e}")
         self._sel = [s for s in self._sel if s not in del_ids]
-        return ok, kept, site_stats
+        # 整理联动：删了数据的种子同步清理媒体库硬链接文件与转移记录
+        t_stats = self._clean_transfer_records(del_data_hashes) if del_data_hashes else {}
+        if t_stats:
+            logger.info(f"跨站独苗种子清理：整理联动完成 转移记录 {t_stats.get('records', 0)} 条 / "
+                        f"媒体文件 {t_stats.get('files', 0)} 个 / 共享跳过 {t_stats.get('skipped', 0)} 个")
+        return ok, kept, site_stats, t_stats
+
+    # ==================== 整理联动（媒体库硬链接 + 转移记录） ====================
+
+    def _clean_transfer_records(self, del_hashes: List[str]) -> Dict[str, int]:
+        """
+        对已删除数据文件的种子，同步清理 MoviePilot 整理产生的媒体库硬链接文件与转移记录。
+        匹配：transferhistory.download_hash == 下载器种子 hash（精确）。
+        删媒体文件的双重保护：
+        1. 共享引用保护：该目标文件还有本次删除范围之外的转移记录指向（其他来源也整理到此文件）→ 只删记录不删文件；
+        2. 链接数保护：硬链接 nlink > 1（下载器侧仍有源文件链接或其他硬链）→ 只删记录不删文件；
+        外部存储（dest_storage 非 local）：不动文件只删记录。
+        返回 {records: 删记录数, files: 删文件数, skipped: 文件被保护跳过数}
+        """
+        stats = {"records": 0, "files": 0, "skipped": 0}
+        if not self._clean_media_links or not del_hashes:
+            return stats
+        import os
+        try:
+            from app.db import SessionFactory
+            from app.db.models.transferhistory import TransferHistory
+            from sqlalchemy import select
+        except Exception as e:
+            logger.warning(f"跨站独苗种子清理：整理联动不可用（数据库模块导入失败）：{e}")
+            return stats
+        try:
+            with SessionFactory() as session:
+                all_rows = list(session.execute(select(TransferHistory)).scalars().all())
+                by_hash: Dict[str, List[Any]] = {}
+                dest_refs: Dict[str, set] = {}
+                for r in all_rows:
+                    dh = (getattr(r, "download_hash", "") or "").lower()
+                    if dh:
+                        by_hash.setdefault(dh, []).append(r)
+                    dest = getattr(r, "dest", "") or ""
+                    if dest and dh:
+                        dest_refs.setdefault(dest, set()).add(dh)
+                del_set = {h.split("@")[0].lower() for h in del_hashes}
+                # 本次要删的转移记录（按 hash 精确命中）
+                touched: Dict[int, Any] = {}
+                for h in del_set:
+                    for r in by_hash.get(h, []):
+                        touched[r.id] = r
+                if not touched:
+                    logger.info("跨站独苗种子清理：整理联动未命中任何转移记录（种子未经 MoviePilot 整理或不匹配）")
+                    return stats
+                for rid, r in touched.items():
+                    dest = getattr(r, "dest", "") or ""
+                    dest_storage = str(getattr(r, "dest_storage", "") or "").lower()
+                    can_del_file = False
+                    if dest and dest_storage in ("", "local"):
+                        other_refs = dest_refs.get(dest, set()) - del_set
+                        if not other_refs:
+                            try:
+                                st = os.stat(dest)
+                                can_del_file = st.st_nlink <= 1  # 硬链接已无其他引用
+                            except FileNotFoundError:
+                                pass  # 文件本身已不存在（move 模式/已手动删），仅删记录
+                            except Exception:
+                                can_del_file = False
+                        if can_del_file:
+                            try:
+                                os.remove(dest)
+                                stats["files"] += 1
+                                self._prune_empty_dirs(os.path.dirname(dest))
+                            except Exception as e:
+                                logger.warning(f"跨站独苗种子清理：删除媒体文件失败 {dest}：{e}")
+                        elif os.path.exists(dest):
+                            stats["skipped"] += 1
+                    try:
+                        session.delete(r)
+                        stats["records"] += 1
+                    except Exception as e:
+                        logger.warning(f"跨站独苗种子清理：删除转移记录 #{rid} 失败：{e}")
+                session.commit()
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：整理联动执行异常：{e}")
+        return stats
+
+    @staticmethod
+    def _prune_empty_dirs(path: str, max_up: int = 4):
+        """删除媒体文件后向上清理连续空目录（最多 max_up 层，遇非空/异常即停）"""
+        import os
+        p = str(path or "").rstrip("/")
+        for _ in range(max_up):
+            if not p or p == "/" or len(p) < 6:
+                return
+            try:
+                if os.path.isdir(p) and not os.listdir(p):
+                    os.rmdir(p)
+                else:
+                    return
+            except Exception:
+                return
+            p = os.path.dirname(p)
 
     # ==================== 回收站（误删恢复） ====================
 
@@ -1339,7 +1464,7 @@ class CrossSeedCleaner(_PluginBase):
                 break
         if not target:
             return {"success": False, "message": "条目不存在，请重新扫描"}
-        ok, _, _ = self._delete_entries([target])
+        ok, _, _, _ = self._delete_entries([target])
         return {"success": ok > 0, "message": f"已删除 {ok} 个" if ok else "删除失败"}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
@@ -1355,13 +1480,14 @@ class CrossSeedCleaner(_PluginBase):
         targets = [e for g in groups for e in g.get("entries", []) if e.get("id") in selected]
         if not targets:
             return {"success": False, "message": "勾选条目不在结果中，请重新扫描"}
-        ok, kept, site_stats = self._delete_entries(targets)
+        ok, kept, site_stats, t_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站独苗种子清理：删除勾选完成 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(
                 f"{self._notify_title_prefix}: 跨站独苗种子清理-删除勾选 {ok}/{len(targets)} 个种子"
                 f"（释放约 {self._fmt_size(total_freed)}）"
+                + self._transfer_stats_text(t_stats)
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         return {"success": True, "ok": ok, "total": len(targets)}
@@ -1376,13 +1502,14 @@ class CrossSeedCleaner(_PluginBase):
         targets = [e for g in groups for e in g.get("entries", [])]
         if not targets:
             return {"success": False, "message": "当前无结果"}
-        ok, kept, site_stats = self._delete_entries(targets)
+        ok, kept, site_stats, t_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站独苗种子清理：全部删除完成 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(
                 f"{self._notify_title_prefix}: 跨站独苗种子清理-删除全部独苗 {ok}/{len(targets)} 个种子"
                 f"（释放约 {self._fmt_size(total_freed)}）"
+                + self._transfer_stats_text(t_stats)
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
         return {"success": True, "ok": ok, "total": len(targets)}
@@ -1425,6 +1552,7 @@ class CrossSeedCleaner(_PluginBase):
             "protected_keywords": self._protected_keywords,
             "protect_uploaded_gb": self._protect_uploaded_gb,
             "recycle_enabled": self._recycle_enabled,
+            "clean_media_links": self._clean_media_links,
             "custom_downloaders": self._custom_downloaders,
         })
 
