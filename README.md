@@ -1,8 +1,8 @@
 # MoviePilot 自定义插件包
 
-包含五个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种的清理。
+包含六个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种 / 跨站独苗种子的清理维护。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 5 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 6 个插件文件）。
 
 ## 插件列表
 
@@ -78,7 +78,7 @@
 
 ---
 
-### 5. 站点已删除种子清理（SiteDeletedTorrentCleaner）v1.0
+### 5. 站点已删除种子清理（SiteDeletedTorrentCleaner）v1.6
 
 **解决痛点**：站点种子被删除/失效（站点清种、违规删除、Tracker 失效）后，下载器中仍保留对应死种任务，占用做种资源、影响做种统计。
 
@@ -86,13 +86,37 @@
 - **判定依据**：读取每个种子的 tracker 报错消息（qBittorrent tracker `msg` / Transmission `lastAnnounceResult`），命中关键词（如 `torrent not found`、`unregistered`、`not registered`、`不存在`、`已删除` 等）即判定为“站点已删除”，关键词可配置
 - **扫描范围**：自动遍历 MoviePilot 全部已配置下载器，另支持**自定义下载器**（不在 MoviePilot 中的 qBittorrent/Transmission，按 `类型|地址|端口|用户名|密码` 填写）
 - **界面交互**：展示死种列表（名称/大小/进度/站点/tracker 报错），单条勾选、组内全选、一键全选；删除单个 / 删除选中 / 删除全部 / 清空结果
+- **站点识别**（v1.2/v1.3）：按 tracker 域名匹配 MoviePilot 站点管理站点名显示（如「馒头/家园/观众」，匹配不到显示域名）；qB 批量查询 trackers 偶发失败时自动重试并回退（RPC → torrent 字段 → 磁力链 tr= 参数），站点不再丢失
+- **按站点分组**（v1.4）：同一站点跨下载器的死种聚合展示（组头显示站点名与各下载器分布统计，如 馒头:12 / qb-mp:3），组级全选/删除本组按站点精确过滤；展示分组方式可切换按站点/按下载器
+- **误删恢复**（v1.6）：删除种子前自动备份到回收站——qB 导出 .torrent 文件（完整备份）、TR 记录磁力链（均含原保存路径）；插件页支持一键恢复（暂停添加→重新校验数据→启动，删了数据文件的会自动重新下载）、单条清除备份、一键清空；配置页可关闭备份
 - **删除行为**：默认仅删任务保留文件；可配置「允许删除数据文件」并带**辅种保护**——若数据文件仍被其他种子做种则不删数据文件，仅当无其他种子辅种时才连同数据文件删除
 - **触发方式**：页面手动「扫描死种」+ 配置 cron 定时扫描（可开启「定时扫描后自动删除」）
 - **通知**：飞书 Webhook 或系统消息
 
-**配置项**：启用、执行周期、允许删除数据文件、定时后自动删除、自定义下载器、tracker 判定关键词、飞书 Webhook、通知前缀、立即运行一次。
+**配置项**：启用、执行周期、允许删除数据文件、定时后自动删除、展示分组方式、自定义下载器、tracker 判定关键词、删除前备份开关、飞书 Webhook、通知前缀、立即运行一次。
 
 **依赖**：MoviePilot v2（使用 DownloaderHelper + qbittorrentapi / transmission-rpc 获取 tracker 状态）。
+
+---
+
+### 6. 跨站独苗种子清理（CrossSeedCleaner）v1.6
+
+**解决痛点**：同一内容只在一个站点做种（独苗），该站删种/跑路即内容全失，抗风险能力为零；反过来，已有 2 站以上做种的内容，其中某站的死种即可安全清理释放空间。
+
+**核心能力**：
+- **独苗判定**：按内容聚合分组（种子名称 / 数据路径两种方式，跨下载器），统计该内容在哪些站点有做种：仅 1 站 = 独苗清理候选，≥2 站自动保留（跨站保流）；同名不同发布（如 WEBRip 与 WEB-DL）天然分组隔离互不干扰
+- **双下载器支持**：Transmission（RPC 直连一次拉取全部种子）+ qBittorrent（并发抓 trackers，自动过滤 DHT/PEX/LSD 伪 tracker）；支持 MoviePilot 已配置下载器与自定义下载器（`类型|地址|端口|用户名|密码`）
+- **保护规则**：含未完成种子的组整体跳过（下载/校验中不删）；保护站点白名单（多选下拉，选项自动读站点管理）；保护关键词；累计上传量阈值（阈值 0 = 仅清理从未上传过的种子，正常数值 = 组内累计上传≥N GB 整组保留）
+- **安全删除**：删除前自动备份到回收站——qB 导出 .torrent 文件、TR 记录磁力链（均含原保存路径），支持一键恢复（暂停添加→重新校验数据→启动）；数据文件辅种保护：数据仍被删除范围之外的种子引用时自动降级为仅删任务；删数据文件默认关闭，需在配置页显式开启；分批删除快照落盘备查
+- **信息展示**（v1.5/v1.6）：每条种子带站点名标签、最新上传日期（TR `activityDate` / qB `last_activity`）与累计已传量；结果组按「组内最新上传时间」排序（默认旧→新，最久未传/从未上传的组排最前便于优先决策，一键切换新→旧），组内条目同方向排序，从未上传的组单独标记
+- **通知**：删除通知按站点汇总清理数量与释放空间（删数据/仅删任务分开计）；飞书 Webhook 或系统消息
+- **触发方式**：页面手动「扫描分析」+ Cron 定时扫描（可开启「定时扫描后自动清理」，不开启则仅分析通知）
+
+**配置项**：启用、允许删除数据文件、定时后自动清理、删除前备份开关、含未完成种子的组跳过、内容聚合方式、执行周期（Cron）、累计上传保护阈值GB、保护站点（多选）、保护关键词、自定义下载器、飞书 Webhook、通知前缀、立即运行一次。
+
+**版本历史**：v1.0 首发（TR/QB 双下载器聚合+独苗判定+全套保护+回收站备份）；v1.2 站点维度删除统计；v1.3 站点名称对齐站点管理+插件更名+保护站点多选下拉；v1.4 保护站点空值迁移+上传阈值语义修正；v1.5 结果页新增最新上传时间列；v1.6 条目站点名标签+按最新上传时间排序（升降序一键切换）。
+
+**依赖**：MoviePilot v2（DownloaderHelper + Transmission RPC / qbittorrentapi）。
 
 ---
 
@@ -101,10 +125,10 @@
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/` 和 `sitedeletedtorrentcleaner/` 五个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/`、`sitedeletedtorrentcleaner/` 和 `crossseedcleaner/` 六个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`
+    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`、`CrossSeedCleaner`
 4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
@@ -118,3 +142,4 @@
 - 源码不含任何个人配置（Webhook、Token 等均在安装后由配置页面填写）
 - 豆瓣数据接口为 MoviePilot 内置模块，无需额外 Key；Bangumi 无需 Key
 - 兼容性：基于 MoviePilot v2 API 开发；MoviePilot v3（新架构）可能需要适配
+
