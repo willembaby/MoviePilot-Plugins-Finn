@@ -105,7 +105,7 @@ class CrossSeedCleaner(_PluginBase):
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -132,6 +132,7 @@ class CrossSeedCleaner(_PluginBase):
     _scheduler = None
     _sel: List[str] = []
     _sort_order = "asc"           # 结果排序：asc=最新上传 旧→新（最久未传在前）/ desc=新→旧
+    _view_mode = "group"          # 结果视图：group=按内容组 / downloader=按下载器分组
     _site_map_cache: Optional[Dict[str, str]] = None
 
     # 内置常见 PT 站点 tracker 主域 -> 站点名（实测映射，MP 站点表优先生效）
@@ -210,6 +211,7 @@ class CrossSeedCleaner(_PluginBase):
             self._custom_downloaders = config.get("custom_downloaders") or ""
         self._sel = []
         self._sort_order = "asc"
+        self._view_mode = "group"
 
         if legacy_pv:
             # 一次性迁移：把旧字符串格式（含空串）写回为纯净空列表，消除配置页空白 chip
@@ -260,6 +262,7 @@ class CrossSeedCleaner(_PluginBase):
             {"path": "/delete_selected", "endpoint": self.delete_selected_api, "methods": ["GET"], "summary": "删除勾选条目"},
             {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部独苗"},
             {"path": "/sort", "endpoint": self.sort_api, "methods": ["GET"], "summary": "切换结果排序(按最新上传时间)"},
+            {"path": "/view", "endpoint": self.view_api, "methods": ["GET"], "summary": "切换结果视图(内容组/下载器)"},
             {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空扫描结果"},
             {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
             {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
@@ -395,6 +398,7 @@ class CrossSeedCleaner(_PluginBase):
 
         groups = sorted(groups, key=_g_latest, reverse=rev)
         sort_label = "排序:最新上传 新→旧" if rev else "排序:最新上传 旧→新"
+        view_label = "视图:按下载器" if self._view_mode == "group" else "视图:按内容组"
 
         page = []
         page.append({
@@ -410,11 +414,13 @@ class CrossSeedCleaner(_PluginBase):
             'component': 'VRow',
             'props': {'class': 'mb-1'},
             'content': [
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                  'content': [self._btn("扫描分析", 'plugin/CrossSeedCleaner/scan', {}, 'primary', 'elevated')]},
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                  'content': [self._btn(sort_label, 'plugin/CrossSeedCleaner/sort', {}, 'secondary', 'tonal')]},
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                 'content': [self._btn(view_label, 'plugin/CrossSeedCleaner/view', {}, 'secondary', 'tonal')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                  'content': [self._btn("清空结果", 'plugin/CrossSeedCleaner/clear',
                                        {'confirm': 'yes'}, 'secondary', 'text')]},
             ]
@@ -436,6 +442,30 @@ class CrossSeedCleaner(_PluginBase):
             page.append({'component': 'VAlert',
                          'props': {'type': 'success', 'variant': 'tonal',
                                    'text': '当前无独苗种子：全部内容均有 2 个以上站点做种，或已全部处理/保护命中'}})
+        elif self._view_mode == "downloader":
+            # 下载器视图：跨内容组聚合，按已配置下载器分组展示
+            by_dl: Dict[str, List[dict]] = {}
+            dl_group_n: Dict[str, set] = {}
+            for g in groups:
+                for e in g.get("entries", []):
+                    dl = str(e.get("downloader", "") or "?")
+                    by_dl.setdefault(dl, []).append(e)
+                    dl_group_n.setdefault(dl, set()).add(g.get("gid", ""))
+            for dl in sorted(by_dl.keys()):
+                ents = sorted(by_dl[dl], key=lambda e: int(e.get("upload_time") or 0), reverse=rev)
+                dl_sel = sum(1 for e in ents if e.get("id", "") in selected)
+                page.append({
+                    'component': 'VRow',
+                    'props': {'class': 'pa-1 ma-0 mb-1', 'align': 'center',
+                              'style': 'background: rgba(33,150,243,0.10); border-radius: 6px;'},
+                    'content': [
+                        {'component': 'VCol', 'props': {'cols': True},
+                         'content': [{'component': 'div', 'props': {'class': 'text-subtitle-2'},
+                                      'text': f"下载器 {dl}（{len(ents)} 个种子 / {len(dl_group_n[dl])} 个独苗组 / 已勾选 {dl_sel}）"}]},
+                    ]
+                })
+                for e in ents:
+                    page.append(self._entry_row(e, selected))
         else:
             for g in groups:
                 entry_ids = [e.get("id") for e in g.get("entries", [])]
@@ -475,37 +505,7 @@ class CrossSeedCleaner(_PluginBase):
                                               'text': (f"最新上传 {self._fmt_date(g_latest)}" if g_latest else "从未上传")}]},
                             ]
                         },
-                        *[
-                            {
-                                'component': 'VRow',
-                                'props': {'class': 'pa-0 ma-0 ml-4', 'align': 'center', 'dense': True,
-                                          'style': (('background: rgba(76,175,80,0.12); border-radius: 6px;')
-                                                    if (e.get("id", "") in selected) else '')},
-                                'content': [
-                                    {'component': 'VCol', 'props': {'cols': 'auto'},
-                                     'content': [{'component': 'VCheckboxBtn', 'props': {'model-value': (e.get("id", "") in selected), 'density': 'compact'},
-                                                  'events': {'click': {'api': 'plugin/CrossSeedCleaner/toggle',
-                                                                       'method': 'get',
-                                                                       'params': {'apikey': settings.API_TOKEN,
-                                                                                  'id': e.get("id", "")}}}}]},
-                                    {'component': 'VCol', 'props': {'cols': True},
-                                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                                   'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:75]}"}]},
-                                    {'component': 'VCol', 'props': {'cols': 'auto'},
-                                     'content': [{'component': 'VChip',
-                                                  'props': {'size': 'x-small', 'color': 'cyan', 'variant': 'tonal', 'class': 'mr-1'},
-                                                  'text': str(e.get('site_name', '') or '')[:12]}]},
-                                    {'component': 'VCol', 'props': {'cols': 'auto'},
-                                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                                   'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
-                                                            if e.get('uploaded') else '')}]},
-                                    {'component': 'VCol', 'props': {'cols': 'auto'},
-                                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                                  'text': (f"最新上传 {self._fmt_date(e.get('upload_time', 0))}"
-                                                           if e.get('upload_time') else '')}]},
-                                ]
-                            } for e in ents
-                        ],
+                        *[self._entry_row(e, selected) for e in ents],
                     ]
                 })
 
@@ -543,6 +543,58 @@ class CrossSeedCleaner(_PluginBase):
         return page
 
     # ==================== 工具 ====================
+
+    @staticmethod
+    def _file_tag(data_id: str, name: str = "") -> str:
+        """条目文件级小标签：取数据路径尾段（如单集种子的 S01E05.mkv）。
+        整季种子（路径 basename == 种子名，QB/TR content_path 指向根目录）返回空，避免与种子名重复。"""
+        import os
+        p = str(data_id or "").strip()
+        if not p:
+            return ""
+        base = os.path.basename(p.rstrip("/").rstrip("\\"))
+        if not base:
+            return ""
+        if base == str(name or "").strip():
+            return ""
+        return base[:44]
+
+    def _entry_row(self, e: dict, selected: set) -> Dict:
+        """单条种子条目行（组视图/下载器视图共用）：下载器_名称 + 文件标签 + 站点 + 已传 + 最新上传"""
+        ftag = self._file_tag(e.get("data_id", ""), e.get("name", ""))
+        return {
+            'component': 'VRow',
+            'props': {'class': 'pa-0 ma-0 ml-4', 'align': 'center', 'dense': True,
+                      'style': (('background: rgba(76,175,80,0.12); border-radius: 6px;')
+                                if (e.get("id", "") in selected) else '')},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VCheckboxBtn', 'props': {'model-value': (e.get("id", "") in selected), 'density': 'compact'},
+                              'events': {'click': {'api': 'plugin/CrossSeedCleaner/toggle',
+                                                   'method': 'get',
+                                                   'params': {'apikey': settings.API_TOKEN,
+                                                              'id': e.get("id", "")}}}}]},
+                {'component': 'VCol', 'props': {'cols': True},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:70]}"}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VChip',
+                              'props': {'size': 'x-small', 'color': 'brown', 'variant': 'tonal', 'class': 'mr-1'},
+                              'text': ftag}] if ftag else []},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VChip',
+                              'props': {'size': 'x-small', 'color': 'cyan', 'variant': 'tonal', 'class': 'mr-1'},
+                              'text': str(e.get('site_name', '') or '')[:12]}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
+                                       if e.get('uploaded') else '')}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': (f"最新上传 {self._fmt_date(e.get('upload_time', 0))}"
+                                       if e.get('upload_time') else '')}]},
+            ]
+        }
 
     @staticmethod
     def _btn(text: str, api: str, payload: dict, color: str, variant: str = "tonal") -> Dict:
@@ -1068,10 +1120,16 @@ class CrossSeedCleaner(_PluginBase):
         return {"success": True, "message": msg, "selected_count": len(selected)}
 
     def sort_api(self) -> Dict[str, Any]:
-        """切换结果排序：按最新上传时间 旧→新 / 新→旧（从未上传记为最冷，旧→新时排最前）"""
+        """切换结果排序：按最新上传时间 旧→新 / 新→旧（从未上传记录为最冷，旧→新时排最前）"""
         self._sort_order = "desc" if self._sort_order != "desc" else "asc"
         label = "新→旧" if self._sort_order == "desc" else "旧→新"
         return {"success": True, "message": f"已切换排序：最新上传 {label}"}
+
+    def view_api(self) -> Dict[str, Any]:
+        """切换结果视图：内容组（按种子名聚合）/ 下载器（按已配置下载器分组）"""
+        self._view_mode = "downloader" if self._view_mode != "downloader" else "group"
+        label = "按下载器" if self._view_mode == "downloader" else "按内容组"
+        return {"success": True, "message": f"已切换视图：{label}"}
 
     # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
 
