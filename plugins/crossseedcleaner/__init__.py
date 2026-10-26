@@ -99,10 +99,11 @@ class CrossSeedCleaner(_PluginBase):
     plugin_name = "跨站独苗种子清理"
     plugin_desc = ("按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数："
                    "仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；"
+                   "条目带站点名与最新上传日期，结果可按最新上传时间排序；"
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -127,6 +128,7 @@ class CrossSeedCleaner(_PluginBase):
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _scheduler = None
     _sel: List[str] = []
+    _sort_order = "asc"           # 结果排序：asc=最新上传 旧→新（最久未传在前）/ desc=新→旧
     _site_map_cache: Optional[Dict[str, str]] = None
 
     # 内置常见 PT 站点 tracker 主域 -> 站点名（实测映射，MP 站点表优先生效）
@@ -203,6 +205,7 @@ class CrossSeedCleaner(_PluginBase):
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
             self._custom_downloaders = config.get("custom_downloaders") or ""
         self._sel = []
+        self._sort_order = "asc"
 
         if legacy_pv:
             # 一次性迁移：把旧字符串格式（含空串）写回为纯净空列表，消除配置页空白 chip
@@ -252,6 +255,7 @@ class CrossSeedCleaner(_PluginBase):
             {"path": "/delete", "endpoint": self.delete_api, "methods": ["GET"], "summary": "删除单条"},
             {"path": "/delete_selected", "endpoint": self.delete_selected_api, "methods": ["GET"], "summary": "删除勾选条目"},
             {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部独苗"},
+            {"path": "/sort", "endpoint": self.sort_api, "methods": ["GET"], "summary": "切换结果排序(按最新上传时间)"},
             {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空扫描结果"},
             {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
             {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
@@ -373,6 +377,18 @@ class CrossSeedCleaner(_PluginBase):
         stat = saved.get("stat") or {}
         selected = set(self._sel)
 
+        # 组排序：按组内最新上传时间；0=从未上传视为最冷。默认旧→新（最久未传的组在前，优先清理参考）
+        rev = (self._sort_order == "desc")
+
+        def _g_latest(g: dict) -> int:
+            try:
+                return max([int(e.get("upload_time") or 0) for e in g.get("entries", [])] or [0])
+            except Exception:
+                return 0
+
+        groups = sorted(groups, key=_g_latest, reverse=rev)
+        sort_label = "排序:最新上传 新→旧" if rev else "排序:最新上传 旧→新"
+
         page = []
         page.append({
             'component': 'VAlert',
@@ -380,24 +396,32 @@ class CrossSeedCleaner(_PluginBase):
                       'text': (f"分析时间：{scan_time or '尚未扫描'}   种子总数 {stat.get('total', 0)}   "
                                f"多站保留 {stat.get('keep_groups', 0)} 组   独苗待清理 {len(groups)} 组"
                                f"({stat.get('del_seeds', 0)} 种子/{self._fmt_size(stat.get('del_size', 0))})   "
-                               f"已勾选 {len(selected)} 个")}
+                               f"已勾选 {len(selected)} 个   当前排序：最新上传{'新→旧' if rev else '旧→新'}")}
         })
 
         page.append({
             'component': 'VRow',
             'props': {'class': 'mb-1'},
             'content': [
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                  'content': [self._btn("扫描分析", 'plugin/CrossSeedCleaner/scan', {}, 'primary', 'elevated')]},
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
-                 'content': [self._btn(f"删除选中({len(selected)})", 'plugin/CrossSeedCleaner/delete_selected',
-                                       {'confirm': 'yes'}, 'error', 'elevated')]},
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
-                 'content': [self._btn("删除全部独苗", 'plugin/CrossSeedCleaner/delete_all',
-                                       {'confirm': 'yes'}, 'error', 'text')]},
-                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                 'content': [self._btn(sort_label, 'plugin/CrossSeedCleaner/sort', {}, 'secondary', 'tonal')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                  'content': [self._btn("清空结果", 'plugin/CrossSeedCleaner/clear',
                                        {'confirm': 'yes'}, 'secondary', 'text')]},
+            ]
+        })
+        page.append({
+            'component': 'VRow',
+            'props': {'class': 'mb-2'},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                 'content': [self._btn(f"删除选中({len(selected)})", 'plugin/CrossSeedCleaner/delete_selected',
+                                       {'confirm': 'yes'}, 'error', 'elevated')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                 'content': [self._btn("删除全部独苗", 'plugin/CrossSeedCleaner/delete_all',
+                                       {'confirm': 'yes'}, 'error', 'text')]},
             ]
         })
 
@@ -409,6 +433,9 @@ class CrossSeedCleaner(_PluginBase):
             for g in groups:
                 entry_ids = [e.get("id") for e in g.get("entries", [])]
                 all_sel = all(e in selected for e in entry_ids)
+                g_latest = _g_latest(g)
+                ents = sorted(g.get("entries", []),
+                              key=lambda e: int(e.get("upload_time") or 0), reverse=rev)
                 page.append({
                     'component': 'VCard',
                     'props': {'variant': 'outlined', 'class': 'mb-1', 'density': 'compact'},
@@ -435,6 +462,10 @@ class CrossSeedCleaner(_PluginBase):
                                 {'component': 'VCol', 'props': {'cols': 'auto'},
                                  'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'deep-purple', 'variant': 'tonal'},
                                               'text': self._fmt_size(g.get("size", 0))}]},
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VChip',
+                                              'props': {'size': 'x-small', 'color': 'teal', 'variant': 'tonal'},
+                                              'text': (f"最新上传 {self._fmt_date(g_latest)}" if g_latest else "从未上传")}]},
                             ]
                         },
                         *[
@@ -452,17 +483,21 @@ class CrossSeedCleaner(_PluginBase):
                                                                                   'id': e.get("id", "")}}}}]},
                                     {'component': 'VCol', 'props': {'cols': True},
                                      'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                                  'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:75]}"}]},
+                                                   'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:75]}"}]},
+                                    {'component': 'VCol', 'props': {'cols': 'auto'},
+                                     'content': [{'component': 'VChip',
+                                                  'props': {'size': 'x-small', 'color': 'cyan', 'variant': 'tonal', 'class': 'mr-1'},
+                                                  'text': str(e.get('site_name', '') or '')[:12]}]},
                                     {'component': 'VCol', 'props': {'cols': 'auto'},
                                      'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                                  'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
-                                                           if e.get('uploaded') else '')}]},
+                                                   'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
+                                                            if e.get('uploaded') else '')}]},
                                     {'component': 'VCol', 'props': {'cols': 'auto'},
                                      'content': [{'component': 'div', 'props': {'class': 'text-caption'},
                                                   'text': (f"最新上传 {self._fmt_date(e.get('upload_time', 0))}"
                                                            if e.get('upload_time') else '')}]},
                                 ]
-                            } for e in g.get("entries", [])
+                            } for e in ents
                         ],
                     ]
                 })
@@ -1008,6 +1043,12 @@ class CrossSeedCleaner(_PluginBase):
             msg = f"已勾选全部 {len(ids)} 项"
         self._sel = selected
         return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def sort_api(self) -> Dict[str, Any]:
+        """切换结果排序：按最新上传时间 旧→新 / 新→旧（从未上传记为最冷，旧→新时排最前）"""
+        self._sort_order = "desc" if self._sort_order != "desc" else "asc"
+        label = "新→旧" if self._sort_order == "desc" else "旧→新"
+        return {"success": True, "message": f"已切换排序：最新上传 {label}"}
 
     # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
 
