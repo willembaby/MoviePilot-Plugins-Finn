@@ -16,6 +16,7 @@
 
 import hashlib
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,7 +106,7 @@ class CrossSeedCleaner(_PluginBase):
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -127,6 +128,7 @@ class CrossSeedCleaner(_PluginBase):
     _protected_keywords = ""      # 保护关键词（每行一个，种子名命中则整组保留）
     _protect_uploaded_gb = 0      # 累计上传量保护阈值 GB（0 同样生效：仅清理从未上传过的种子）
     _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
+    _recycle_retention_days = 30  # 回收站备份保留天数（超过自动清理，0=永不清理）（v1.9）
     _clean_media_links = True     # 删数据时同步清理媒体库硬链接文件与转移记录
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _scheduler = None
@@ -207,6 +209,10 @@ class CrossSeedCleaner(_PluginBase):
             except Exception:
                 self._protect_uploaded_gb = 0
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
+            try:
+                self._recycle_retention_days = max(int(config.get("recycle_retention_days") or 30), 0)
+            except Exception:
+                self._recycle_retention_days = 30
             self._clean_media_links = bool(config.get("clean_media_links", True))
             self._custom_downloaders = config.get("custom_downloaders") or ""
         self._sel = []
@@ -267,6 +273,7 @@ class CrossSeedCleaner(_PluginBase):
             {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
             {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
             {"path": "/recycle_clear", "endpoint": self.recycle_clear_api, "methods": ["GET"], "summary": "清空回收站"},
+            {"path": "/clean_recycle", "endpoint": self.clean_recycle_api, "methods": ["GET"], "summary": "清理回收站过期备份（按保留天数）"},
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -304,9 +311,11 @@ class CrossSeedCleaner(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复）'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'recycle_retention_days', 'label': '回收站备份保留天数（超期自动清理，0=永不清理）', 'placeholder': '30'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'skip_active', 'label': '含未完成种子的组跳过（下载/校验中不删）'}}]},
                         ]
                     },
@@ -371,6 +380,7 @@ class CrossSeedCleaner(_PluginBase):
             "protected_keywords": "",
             "protect_uploaded_gb": 0,
             "recycle_enabled": True,
+            "recycle_retention_days": 30,
             "clean_media_links": True,
             "custom_downloaders": "",
         }
@@ -1024,6 +1034,8 @@ class CrossSeedCleaner(_PluginBase):
         return items, result
 
     def _schedule_scan(self):
+        rec_stats = self._clean_recycle()  # v1.9：回收站过期备份自动清理
+        rec_line = self._recycle_line(rec_stats)
         items, result = self._scan_all()
         self.save_data("result", result)
         stat = result.get("stat") or {}
@@ -1035,34 +1047,45 @@ class CrossSeedCleaner(_PluginBase):
             total_freed = sum(s.get("freed", 0) for s in site_stats.values())
             logger.info(f"跨站独苗种子清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
             if self._notify:
-                self._send_notification(
-                    f"{self._notify_title_prefix}: 跨站独苗种子清理-自动清理 {ok}/{len(entries)} 个种子"
-                    f"（释放约 {self._fmt_size(total_freed)}）"
-                    + self._transfer_stats_text(t_stats)
-                    + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
-                    + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
+                text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-自动清理 {ok}/{len(entries)} 个种子"
+                        f"（释放约 {self._fmt_size(total_freed)}）"
+                        + self._transfer_stats_text(t_stats)
+                        + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
+                        + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
+                if rec_line:
+                    text += "\n" + rec_line
+                self._send_notification(text)
         elif self._notify and result.get("groups"):
             site_stat = stat.get("site_stat") or {}
             site_line = " / ".join(f"{k}:{v}" for k, v in
                                    sorted(site_stat.items(), key=lambda x: -x[1])[:8])
-            self._send_notification(
-                f"{self._notify_title_prefix}: 跨站独苗种子清理-发现 {stat.get('del_groups', 0)} 组独苗"
-                f"（{stat.get('del_seeds', 0)} 个种子 / {self._fmt_size(stat.get('del_size', 0))}）\n"
-                f"多站保留 {stat.get('keep_groups', 0)} 组，保护命中 {stat.get('protected', 0)} 组\n"
-                f"站点分布：{site_line or '-'}\n请到插件页面查看并删除")
+            text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-发现 {stat.get('del_groups', 0)} 组独苗"
+                    f"（{stat.get('del_seeds', 0)} 个种子 / {self._fmt_size(stat.get('del_size', 0))}）\n"
+                    f"多站保留 {stat.get('keep_groups', 0)} 组，保护命中 {stat.get('protected', 0)} 组\n"
+                    f"站点分布：{site_line or '-'}\n请到插件页面查看并删除")
+            if rec_line:
+                text += "\n" + rec_line
+            self._send_notification(text)
+        elif self._notify and rec_line:
+            self._send_notification(f"{self._notify_title_prefix}: 跨站独苗种子清理-回收站维护\n" + rec_line)
 
     def scan_api(self) -> Dict[str, Any]:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         logger.info("跨站独苗种子清理：开始扫描分析...")
+        rec_stats = self._clean_recycle()  # v1.9：手动扫描同样顺带清理回收站过期备份
         items, result = self._scan_all()
         self.save_data("result", result)
         self._sel = []
         stat = result.get("stat") or {}
         logger.info(f"跨站独苗种子清理：扫描完成 {stat}")
-        if self._notify and result.get("groups"):
-            self._send_notification(f"{self._notify_title_prefix}: 跨站独苗种子清理-扫描完成，"
-                                    f"独苗 {stat.get('del_groups', 0)} 组 {stat.get('del_seeds', 0)} 个种子，请到插件页面查看")
+        if self._notify and (result.get("groups") or (rec_stats and rec_stats.get("removed"))):
+            text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-扫描完成，"
+                    f"独苗 {stat.get('del_groups', 0)} 组 {stat.get('del_seeds', 0)} 个种子，请到插件页面查看")
+            rec_line = self._recycle_line(rec_stats)
+            if rec_line:
+                text += "\n" + rec_line
+            self._send_notification(text)
         return {"success": True, "stat": stat}
 
     # ==================== 勾选 ====================
@@ -1404,6 +1427,70 @@ class CrossSeedCleaner(_PluginBase):
         if dirty:
             self.save_data("recycle", rec)
 
+    def _clean_recycle(self) -> Optional[Dict[str, int]]:
+        """回收站过期备份自动清理（v1.9）：删除时间超过保留天数的备份条目与 .torrent 文件。
+        保留天数 <=0 表示永不清理；备份关闭时跳过。
+        返回 {"removed": 清理条数, "torrent_files": 删除的种子文件数, "remaining": 剩余条数}，未启用返回 None"""
+        if not self._recycle_enabled or self._recycle_retention_days <= 0:
+            return None
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            return None
+        if not rec:
+            return {"removed": 0, "torrent_files": 0, "remaining": 0}
+        now = datetime.now()
+        cutoff = now - timedelta(days=self._recycle_retention_days)
+        removed = 0
+        torrent_files = 0
+        rdir = None
+        for key in list(rec.keys()):
+            info = rec.get(key) or {}
+            try:
+                deleted_at = datetime.strptime(str(info.get("deleted_at") or ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue  # 无删除时间无法解析则保守保留
+            if deleted_at >= cutoff:
+                continue
+            if info.get("bk_type") == "torrent" and info.get("bk_file"):
+                try:
+                    if rdir is None:
+                        rdir = self._recycle_dir()
+                    fp = os.path.join(rdir, str(info["bk_file"]))
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception as e:
+                    logger.warning(f"跨站独苗种子清理：删除回收站备份文件失败（{info.get('bk_file')}）：{e}")
+                torrent_files += 1
+            rec.pop(key, None)
+            removed += 1
+        if removed:
+            self.save_data("recycle", rec)
+            logger.info(f"跨站独苗种子清理：回收站自动清理完成：删除过期备份 {removed} 条"
+                        f"（含 .torrent 文件 {torrent_files} 个），剩余 {len(rec)} 条，保留天数 {self._recycle_retention_days}")
+        return {"removed": removed, "torrent_files": torrent_files, "remaining": len(rec)}
+
+    def _recycle_line(self, rec_stats: Optional[Dict[str, int]]) -> str:
+        """通知用回收站维护摘要行（无清理时不显示）"""
+        if rec_stats and rec_stats.get("removed"):
+            return (f"回收站维护：清理过期备份 {rec_stats['removed']} 条"
+                    f"（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
+        return ""
+
+    def clean_recycle_api(self) -> Dict[str, Any]:
+        """手动触发回收站过期清理（API）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        stats = self._clean_recycle()
+        if stats is None:
+            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
+        return {"success": True, "removed": stats.get("removed", 0),
+                "torrent_files": stats.get("torrent_files", 0),
+                "remaining": stats.get("remaining", 0),
+                "retention_days": self._recycle_retention_days,
+                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
+                            if stats.get("removed") else "无过期备份")}
+
     def restore_api(self, id: str = "") -> Dict[str, Any]:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
@@ -1610,6 +1697,7 @@ class CrossSeedCleaner(_PluginBase):
             "protected_keywords": self._protected_keywords,
             "protect_uploaded_gb": self._protect_uploaded_gb,
             "recycle_enabled": self._recycle_enabled,
+            "recycle_retention_days": self._recycle_retention_days,
             "clean_media_links": self._clean_media_links,
             "custom_downloaders": self._custom_downloaders,
         })
