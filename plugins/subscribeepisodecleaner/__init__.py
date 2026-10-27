@@ -110,7 +110,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -892,11 +892,12 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 continue
             try:
                 if "transmission" in (dtype or ""):
-                    all_ids = {h: it.get("data_id") or "" for h, it in self._tr_fetch_all(inst, dl).items()}
+                    all_tors = self._tr_fetch_all(inst, dl)
                 elif "qb" in (dtype or ""):
-                    all_ids = {h: it.get("data_id") or "" for h, it in self._qb_fetch_all(inst, dl).items()}
+                    all_tors = self._qb_fetch_all(inst, dl)
                 else:
-                    all_ids = {}
+                    all_tors = {}
+                all_ids = {h: (it.get("data_id") or "") for h, it in all_tors.items()}
             except Exception as e:
                 logger.error(f"订阅剧集自动清理：获取 {dl} 全量种子失败，跳过该下载器：{e}")
                 continue
@@ -907,23 +908,35 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 if h not in all_ids:
                     logger.warning(f"订阅剧集自动清理：种子 {h} 已不在下载器 {dl}，跳过")
                     continue
-                data_id = all_ids.get(h) or ""
-                referenced = False
-                if self._delete_file:
-                    for oh, od in all_ids.items():
-                        oh_plain = oh.split("@")[0]
-                        if oh_plain == h or oh_plain in del_hashes:
-                            continue
-                        if od and data_id and od == data_id:
-                            referenced = True
-                            break
-                if referenced:
-                    kept.append(c.get("name") or h)
-                    continue  # 数据仍被其他种子引用：保留，不删
                 do_hashes.append(h)
+            # 辅种/同内容种子级联：共享同一数据文件的其他种子（如 IYUU 辅种）一并删除，
+            # 否则数据文件被范围外种子引用导致候选永远删不掉（v1.3 修复）
+            cascade = []
+            if self._delete_file and do_hashes:
+                del_set = set(do_hashes)
+                changed = True
+                while changed:
+                    changed = False
+                    del_data = {all_ids.get(h) for h in del_set if all_ids.get(h)}
+                    for h, od in all_ids.items():
+                        if h in del_set or not od:
+                            continue
+                        if od in del_data:
+                            del_set.add(h)
+                            changed = True
+                if len(del_set) > len(do_hashes):
+                    for h in del_set - set(do_hashes):
+                        it = all_tors.get(h) or {}
+                        cascade.append({
+                            "id": f"{dl}|{h}", "hash": h,
+                            "name": it.get("name", ""), "size": int(it.get("size", 0) or 0),
+                            "magnet": it.get("magnet", ""), "save_path": it.get("save_path", ""),
+                        })
+                    logger.info(f"订阅剧集自动清理：{dl} 检测到 {len(cascade)} 个共享数据的辅种/重复种子，一并清理")
+                    do_hashes = list(del_set)
             if not do_hashes:
                 continue
-            self._backup_entries(dl, dtype, inst, items, set(do_hashes))
+            self._backup_entries(dl, dtype, inst, items + cascade, set(do_hashes))
             try:
                 if inst.delete_torrents(delete_file=self._delete_file, ids=do_hashes):
                     ok += len(do_hashes)
@@ -944,11 +957,16 @@ class SubscribeEpisodeCleaner(_PluginBase):
             self.save_data("result", saved)
         except Exception:
             pass
-        # 整理联动
+        # 整理联动（删除后等待 qb 删完数据文件再清硬链接，v1.3）
         t_stats = self._clean_transfer_links(del_data_hashes) if del_data_hashes else {}
         if t_stats:
             logger.info(f"订阅剧集自动清理：媒体库联动完成 转移记录 {t_stats.get('records', 0)} 条 / "
                         f"媒体文件 {t_stats.get('files', 0)} 个 / 跳过 {t_stats.get('skipped', 0)} 个")
+        # 旧集媒体库清理：保留窗口外旧集（含种子已不在下载器的历史集）的媒体文件与转移记录（v1.3）
+        o_stats = self._clean_orphan_episodes()
+        if o_stats and (o_stats.get("files") or o_stats.get("records")):
+            logger.info(f"订阅剧集自动清理：旧集媒体清理完成 媒体文件 {o_stats.get('files', 0)} 个 / "
+                        f"转移记录 {o_stats.get('records', 0)} 条")
         # 更新订阅 note：把这些剔除的集号标记为"已下载过"，防止重下
         self._mark_episodes_done()
         return ok, kept, t_stats
@@ -1034,6 +1052,14 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     if dest and dest_storage in ("", "local"):
                         other_refs = dest_refs.get(dest, set()) - del_set
                         if not other_refs:
+                            # v1.3：qb 删除数据文件是异步的，需等待源文件从磁盘消失后再判 nlink，
+                            # 否则瞬间 nlink 仍为 2 被误保护（单文件最多等待 ~60s）
+                            src = (getattr(r, "src", "") or "").strip()
+                            if src and os.path.exists(src):
+                                for _ in range(10):
+                                    time.sleep(6)
+                                    if not os.path.exists(src):
+                                        break
                             try:
                                 st = os.stat(dest)
                                 can_del_file = st.st_nlink <= 1
@@ -1058,6 +1084,78 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 session.commit()
         except Exception as e:
             logger.error(f"订阅剧集自动清理：媒体库联动执行异常：{e}")
+        return stats
+
+    def _clean_orphan_episodes(self) -> Dict[str, int]:
+        """旧集媒体库清理（v1.3）：保留窗口外的旧集（含种子已不在下载器的历史集、
+        以及此前已删种子但媒体文件因异步删除被跳过的欠账）——按订阅副除集号清理
+        媒体目录文件（视频+附属 nfo/jpg）与转移记录。文件删除前校验集号在副除集内且位于
+        该剧自身的媒体目录内，保留集不受影响。"""
+        stats = {"files": 0, "records": 0}
+        if not self._clean_media_links:
+            return stats
+        saved = self.get_data("result") or {}
+        subs_results = saved.get("subs") or []
+        if not subs_results:
+            return stats
+        try:
+            from app.db import SessionFactory
+            from app.db.models.transferhistory import TransferHistory
+            from sqlalchemy import select
+        except Exception as e:
+            logger.warning(f"订阅剧集自动清理：旧集清理不可用（数据库模块导入失败）：{e}")
+            return stats
+        try:
+            with SessionFactory() as session:
+                for r in subs_results:
+                    sub = r.get("sub") or {}
+                    title = str(sub.get("name") or "").strip()
+                    drop_eps = {int(x) for x in (r.get("drop_eps") or [])}
+                    if not title or not drop_eps:
+                        continue
+                    rows = list(session.execute(
+                        select(TransferHistory).where(TransferHistory.title == title)).scalars().all()) or []
+                    dest_dirs = set()
+                    del_records = []
+                    for rec in rows:
+                        dest = (getattr(rec, "dest", "") or "").strip()
+                        if dest:
+                            dest_dirs.add(os.path.dirname(dest))
+                        eps = self._parse_hist_eps(getattr(rec, "episodes", ""))
+                        if eps and (set(eps) & drop_eps):
+                            del_records.append(rec)
+                    for rec in del_records:
+                        try:
+                            session.delete(rec)
+                            stats["records"] += 1
+                        except Exception as e:
+                            logger.warning(f"订阅剧集自动清理：旧集转移记录删除失败 #{getattr(rec, 'id', '?')}：{e}")
+                    session.commit()
+                    # 目录扫描：按文件名集号清理（覆盖转移记录已被早前清理但文件欠账的场景）
+                    for d in dest_dirs:
+                        if not d or not os.path.isdir(d):
+                            continue
+                        for fn in os.listdir(d):
+                            m = re.search(r"S\d{1,2}E(\d{2,4})", fn) or re.search(r"第\s*(\d{1,4})\s*集", fn)
+                            if not m:
+                                continue
+                            try:
+                                epno = int(m.group(1))
+                            except Exception:
+                                continue
+                            if epno not in drop_eps:
+                                continue
+                            p = os.path.join(d, fn)
+                            try:
+                                if os.path.isfile(p):
+                                    os.remove(p)
+                                    stats["files"] += 1
+                            except Exception as e:
+                                logger.warning(f"订阅剧集自动清理：旧集媒体文件删除失败 {p}：{e}")
+                    logger.info(f"订阅剧集自动清理：《{title}》旧集清理完成：媒体文件 {stats['files']} 个，"
+                                f"转移记录 {stats['records']} 条")
+        except Exception as e:
+            logger.error(f"订阅剧集自动清理：旧集媒体清理执行异常：{e}")
         return stats
 
     @staticmethod
