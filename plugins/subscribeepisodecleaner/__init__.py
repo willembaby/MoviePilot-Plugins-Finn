@@ -110,7 +110,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -123,6 +123,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
     _cron = "0 3 * * *"
     _subscribe_ids = []         # 指定订阅 ID 列表（多选）
     _keep_episodes = 5           # 保留最新几集
+    _final_clean = True           # 完结后自动全清（订阅归档进入历史表后生效）
+    _final_grace_days = 7         # 完结后保留天数（从完结日起，到期全部清理）
     _season = ""                 # 覆盖季（留空用订阅自带季）
     _match_keywords = ""         # 额外匹配词（每行一个，种子名命中任一即归属该订阅）
     _delete_file = True          # 删除数据文件 + 退出做种（本插件核心行为）
@@ -157,6 +159,11 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 self._keep_episodes = 5
             self._season = str(config.get("season") or "").strip()
             self._match_keywords = config.get("match_keywords", "") or ""
+            self._final_clean = bool(config.get("final_clean", True))
+            try:
+                self._final_grace_days = max(int(config.get("final_grace_days") or 7), 0)
+            except Exception:
+                self._final_grace_days = 7
             self._delete_file = bool(config.get("delete_file", True))
             self._clean_media_links = bool(config.get("clean_media_links", True))
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
@@ -268,8 +275,14 @@ class SubscribeEpisodeCleaner(_PluginBase):
                          'content': [{'component': 'VTextField', 'props': {'model': 'season', 'label': '季（留空用订阅自带季，如 1）', 'placeholder': ''}}]},
                     ]},
                     {'component': 'VRow', 'content': [
-                        {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                         'content': [{'component': 'VSwitch', 'props': {'model': 'final_clean', 'label': '完结后自动全清（订阅归档进入历史表后生效）'}}]},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                         'content': [{'component': 'VTextField', 'props': {'model': 'final_grace_days', 'label': '完结后保留天数（从完结日起，到期全部清理）', 'placeholder': '7'}}]},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                          'content': [{'component': 'VTextField', 'props': {'model': 'cron', 'label': '执行周期(Cron)', 'placeholder': '0 3 * * *（每天3点）'}}]},
+                    ]},
+                    {'component': 'VRow', 'content': [
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                          'content': [{'component': 'VTextField', 'props': {'model': 'notify_title_prefix', 'label': '通知前缀', 'placeholder': 'HA通知'}}]},
                     ]},
@@ -293,6 +306,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "cron": "0 3 * * *",
             "subscribe_ids": [],
             "keep_episodes": 5,
+            "final_clean": True,
+            "final_grace_days": 7,
             "season": "",
             "match_keywords": "",
             "delete_file": True,
@@ -802,18 +817,274 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "free_size": sum(int(c.get("size") or 0) for c in candidates),
         }
 
+    # ==================== 完结检测与全清（v1.5） ====================
+
+    def _snapshot_registry(self, subs: List[Dict[str, Any]]):
+        """快照活跃订阅身份（id/name/year/season/tmdbid），供订阅完结归档后追溯。"""
+        reg = self.get_data("sub_registry") or {}
+        for s in subs:
+            sid = str(s.get("id"))
+            reg[sid] = {"name": s.get("name"), "year": s.get("year"),
+                        "season": s.get("season"), "tmdbid": s.get("tmdbid")}
+        if reg:
+            self.save_data("sub_registry", reg)
+
+    def _query_completed_message_time(self, title: str) -> Optional[datetime]:
+        """从 message 表查该剧「已完成订阅」通知时间（MP 完结时会发），作为精确完结时间。"""
+        if not title:
+            return None
+        try:
+            from app.db import SessionFactory
+            from app.db.models.message import Message
+            from sqlalchemy import or_
+        except Exception:
+            return None
+        try:
+            with SessionFactory() as session:
+                rows = session.query(Message).filter(
+                    Message.title.like(f"%{title}%"),
+                    or_(Message.title.like("%已完成%"), Message.title.like("%完成订阅%"))
+                ).order_by(Message.reg_time.desc()).limit(5).all()
+                for r in rows or []:
+                    v = getattr(r, "reg_time", None)
+                    if v:
+                        if isinstance(v, str):
+                            try:
+                                v = datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                continue
+                        return v
+        except Exception as e:
+            logger.debug(f"订阅剧集自动清理：查完结消息时间失败：{e}")
+        return None
+
+    def _load_history_sub(self, info: Dict[str, Any]) -> bool:
+        """确认该剧已在 subscribehistory（完结归档）。"""
+        try:
+            from app.db import SessionFactory
+            from app.db.models.subscribehistory import SubscribeHistory
+            from sqlalchemy import and_
+        except Exception:
+            return False
+        try:
+            with SessionFactory() as session:
+                q = session.query(SubscribeHistory)
+                conds = []
+                tid = info.get("tmdbid")
+                if tid:
+                    conds.append(SubscribeHistory.tmdbid == tid)
+                else:
+                    conds.append(SubscribeHistory.name == info.get("name"))
+                if conds:
+                    q = q.filter(*conds)
+                return q.count() > 0
+        except Exception as e:
+            logger.warning(f"订阅剧集自动清理：查完结历史失败：{e}")
+            return False
+
+    def _handle_completed_subs(self) -> None:
+        """完结订阅处理入口（v1.5）：检测配置中已归档完结的订阅 → 记录完结日期 →
+        宽限期（final_grace_days）后全清（种子含辅种、媒体文件、转移记录），
+        并从插件配置中移除该订阅。"""
+        if not self._subscribe_ids:
+            return
+        reg = self.get_data("sub_registry") or {}
+        comp = self.get_data("completed") or {}
+        now = datetime.now()
+        removed_ids: List[str] = []
+        for sid in list(self._subscribe_ids):
+            if self._load_subscribe(sid):
+                continue  # 仍在活跃订阅表
+            info = reg.get(str(sid))
+            if not info or not info.get("name"):
+                logger.warning(f"订阅剧集自动清理：订阅 {sid} 已不在订阅表且无快照身份，跳过完结检测")
+                continue
+            if not self._load_history_sub(info):
+                logger.warning(f"订阅剧集自动清理：《{info.get('name')}》已不在订阅表但未查到完结历史"
+                               f"（可能被手动删除），跳过完结处理")
+                continue
+            # 记录/补全完结时间：优先用 MP「已完成订阅」消息时间，其次首次检测时间
+            rec = comp.get(str(sid)) or {}
+            completed_at = rec.get("completed_at")
+            if not completed_at:
+                mt = self._query_completed_message_time(info.get("name"))
+                completed_at = (mt or now).strftime("%Y-%m-%d %H:%M:%S")
+                comp[str(sid)] = {"name": info.get("name"), "completed_at": completed_at,
+                                  "notified": False}
+                self.save_data("completed", comp)
+                rec = comp[str(sid)]
+            try:
+                cdt = datetime.strptime(completed_at, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                cdt = now
+            days_left = self._final_grace_days - (now - cdt).days
+            if not self._final_clean:
+                if self._notify and not rec.get("notified"):
+                    self._send_notification(
+                        f"{self._notify_title_prefix}: 订阅剧集自动清理-《{info.get('name')}》已完结\n"
+                        f"完结自动清理未开启，本订阅停止定期清理（请自行处理或从配置中移除）")
+                    rec["notified"] = True
+                    self.save_data("completed", comp)
+                continue
+            if days_left > 0:
+                if self._notify and not rec.get("notified"):
+                    due = (cdt + timedelta(days=self._final_grace_days)).strftime("%Y-%m-%d")
+                    self._send_notification(
+                        f"{self._notify_title_prefix}: 订阅剧集自动清理-《{info.get('name')}》已完结\n"
+                        f"将于 {due}（{days_left} 天后）自动清理全部剧集（含保留集、辅种与媒体文件）")
+                    rec["notified"] = True
+                    self.save_data("completed", comp)
+                logger.info(f"订阅剧集自动清理：《{info.get('name')}》已完结（{completed_at}），"
+                            f"宽限期还剩 {days_left} 天")
+                continue
+            # 到期 → 全清
+            logger.info(f"订阅剧集自动清理：《{info.get('name')}》完结宽限期已到，开始全清")
+            try:
+                w_stats = self._final_wipe(str(sid), info)
+                w_stats = w_stats or {}
+                if self._notify:
+                    self._send_notification(
+                        f"{self._notify_title_prefix}: 订阅剧集自动清理-《{info.get('name')}》完结清理完成\n"
+                        f"删除种子 {w_stats.get('torrents', 0)} 个（含辅种）/ 媒体文件 {w_stats.get('files', 0)} 个"
+                        f"与转移记录 {w_stats.get('records', 0)} 条\n已从插件订阅列表移除该订阅")
+            except Exception as e:
+                logger.error(f"订阅剧集自动清理：《{info.get('name')}》完结全清异常：{e}")
+                continue
+            removed_ids.append(str(sid))
+        if removed_ids:
+            for sid in removed_ids:
+                comp.pop(sid, None)
+                reg.pop(sid, None)
+            self.save_data("completed", comp)
+            self.save_data("sub_registry", reg)
+            self._subscribe_ids = [x for x in self._subscribe_ids if x not in removed_ids]
+            try:
+                self._SubscribeEpisodeCleaner__update_config()
+            except Exception:
+                pass
+
+    def _final_wipe(self, sid: str, info: Dict[str, Any]) -> Optional[Dict[str, int]]:
+        """完结全清：删除该书全部匹配种子（含辅种级联）+ 媒体文件（含海报/nfo 附属）+ 转移记录。"""
+        sub = {"id": None, "name": info.get("name"), "year": info.get("year"),
+               "season": info.get("season"), "tmdbid": info.get("tmdbid"), "keyword": ""}
+        items = self._scan_all()
+        terms = self._match_terms(sub)
+        _, sub_hashes, hash_eps = self._load_sub_aliases(sub)
+        matched = []
+        for key, it in items.items():
+            if not self._is_matched(it.get("name", ""), terms, sub,
+                                    torrent_hash=it.get("hash", ""), sub_hashes=sub_hashes):
+                continue
+            h = (it.get("hash", "") or "").split("@")[0].lower()
+            hist_eps = hash_eps.get(h) or []
+            _, eps = parse_episodes(it.get("name", ""))
+            it["_eps"] = sorted(set(hist_eps) | set(eps))
+            it["key"] = key
+            matched.append(it)
+        candidates = []
+        all_eps: set = set()
+        for it in matched:
+            eps = it.get("_eps") or []
+            all_eps.update(eps)
+            if self._skip_active and it.get("active"):
+                continue
+            candidates.append({
+                "id": it["key"], "downloader": it.get("dl", ""), "dl_type": it.get("dl_type", ""),
+                "hash": it.get("hash", ""), "name": it.get("name", ""),
+                "eps": eps, "max_ep": max(eps or [0]), "size": int(it.get("size") or 0),
+                "save_path": it.get("save_path", ""), "magnet": it.get("magnet", ""),
+                "data_id": it.get("data_id", ""), "active": bool(it.get("active")),
+            })
+        # 全部集号（含已退种的历史集）都纳入剔除集，驱动旧集媒体清理
+        for h, eps in hash_eps.items():
+            all_eps.update(eps or [])
+        drop_eps = sorted(all_eps)
+        # 写入 result，供 _execute 的统计/note/旧集清理链路复用
+        result = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_torrents": len(items),
+            "subs": [{"sub": {"id": None, "name": info.get("name"), "year": info.get("year"),
+                              "season": info.get("season")},
+                      "keep_eps": [], "drop_eps": drop_eps,
+                      "candidates": list(candidates)}],
+            "candidates": list(candidates),
+            "free_size": sum(int(c.get("size") or 0) for c in candidates),
+        }
+        self.save_data("result", result)
+        stats = {"torrents": 0, "files": 0, "records": 0}
+        if candidates:
+            ok, _kept, t_stats, o_stats = self._execute(candidates)
+            stats["torrents"] = ok
+            stats["files"] = (t_stats or {}).get("files", 0) + (o_stats or {}).get("files", 0)
+            stats["records"] = (t_stats or {}).get("records", 0) + (o_stats or {}).get("records", 0)
+        else:
+            # 无存活种子也要清媒体文件与转移记录
+            o_stats = self._clean_orphan_episodes()
+            stats["files"] = (o_stats or {}).get("files", 0)
+            stats["records"] = (o_stats or {}).get("records", 0)
+        self._wipe_show_extras(info)
+        return stats
+
+    def _wipe_show_extras(self, info: Dict[str, Any]):
+        """完结全清补充：清掉空剧集目录中残留的 poster/season.nfo 等附属并向上清理空目录。"""
+        title = info.get("name") or ""
+        if not title:
+            return
+        try:
+            from app.db import SessionFactory
+            from app.db.models.transferhistory import TransferHistory
+        except Exception:
+            return
+        try:
+            with SessionFactory() as session:
+                rows = session.query(TransferHistory).filter(
+                    TransferHistory.title == title).all() or []
+                dirs = {os.path.dirname((getattr(r, "dest", "") or "")) for r in rows
+                        if getattr(r, "dest", "")}
+            for d in dirs:
+                if not d or not os.path.isdir(d):
+                    continue
+                for fn in os.listdir(d):
+                    if fn.lower() in ("poster.jpg", "season.nfo", "season-poster.jpg") or \
+                            fn.lower().endswith((".nfo", ".jpg")):
+                        try:
+                            os.remove(os.path.join(d, fn))
+                        except Exception:
+                            pass
+                try:
+                    if os.path.isdir(d) and not os.listdir(d):
+                        os.rmdir(d)
+                        # 剧目录（上一级，如「一念永恒 (2020)」）空了也删
+                        p = os.path.dirname(d)
+                        if os.path.isdir(p) and not os.listdir(p):
+                            os.rmdir(p)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"订阅剧集自动清理：完结附属清理失败：{e}")
+
     def _schedule_run(self):
         subs = []
+        missing = []
         for sid in self._subscribe_ids:
             s = self._load_subscribe(sid)
             if s:
                 subs.append(s)
             else:
-                logger.warning(f"订阅剧集自动清理：订阅不存在（ID={sid}）")
+                missing.append(sid)
+        # 完结检测（处理 missing 的订阅：宽限/全清，可能修改 _subscribe_ids）
+        if missing:
+            self._handle_completed_subs()
+            # 重新加载（部分可能已被移除）
+            subs = []
+            for sid in list(self._subscribe_ids):
+                s = self._load_subscribe(sid)
+                if s:
+                    subs.append(s)
+        if subs:
+            self._snapshot_registry(subs)
         if not subs:
-            logger.warning("订阅剧集自动清理：未选择有效订阅，请检查配置")
-            if self._notify:
-                self._send_notification(f"{self._notify_title_prefix}: 订阅剧集自动清理-未选择有效订阅，请检查配置")
+            logger.info("订阅剧集自动清理：当前没有待管理的活跃订阅（可能全部完结已处理）")
             return
         items = self._scan_all()
         agg = self._analyze_all(subs, items)
@@ -841,12 +1112,26 @@ class SubscribeEpisodeCleaner(_PluginBase):
         if not self._subscribe_ids:
             return {"success": False, "message": "未选择订阅"}
         subs = []
+        missing = []
         for sid in self._subscribe_ids:
             s = self._load_subscribe(sid)
             if s:
                 subs.append(s)
+            else:
+                missing.append(sid)
+        if missing:
+            # 手动扫描同样处理完结订阅（检测/通知/到期全清）
+            self._handle_completed_subs()
+            subs = []
+            for sid in list(self._subscribe_ids):
+                s = self._load_subscribe(sid)
+                if s:
+                    subs.append(s)
+        if subs:
+            self._snapshot_registry(subs)
         if not subs:
-            return {"success": False, "message": "所选订阅均不存在"}
+            return {"success": True, "subs": 0, "candidates": 0, "free_size": 0,
+                    "message": "所选订阅均已完结并按完结策略处理"}
         items = self._scan_all()
         agg = self._analyze_all(subs, items)
         self.save_data("result", agg)
@@ -1310,6 +1595,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "cron": self._cron,
             "subscribe_ids": self._subscribe_ids,
             "keep_episodes": self._keep_episodes,
+            "final_clean": self._final_clean,
+            "final_grace_days": self._final_grace_days,
             "season": self._season,
             "match_keywords": self._match_keywords,
             "delete_file": self._delete_file,
