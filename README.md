@@ -1,8 +1,8 @@
-# MoviePilot 自定义插件包
+﻿# MoviePilot 自定义插件包
 
-包含六个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种 / 跨站独苗种子的清理维护。
+包含七个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种 / 跨站独苗种子 / 订阅剧集过期集的清理维护。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 6 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 7 个插件文件）。
 
 ## 插件列表
 
@@ -121,15 +121,36 @@
 
 ---
 
+### 7. 订阅剧集自动清理（SubscribeEpisodeCleaner）v1.0
+
+**解决痛点**：订阅一部电视剧后，随着每周更新已下载剧集越攒越多，占用大量存储空间；同时若只是手工删掉旧集，MoviePilot 会因媒体库比对出该集缺失而**通过订阅再次补下**。
+
+**核心能力**：
+- **指定订阅**：配置页下拉选择要管理的电视剧订阅（自动读取 MoviePilot 全部电视剧订阅）
+- **按集号保留最新 N 集**：扫描该订阅对应下载器中的剧集种子，解析集号，只保留集号最大的 N 集；更早的剧集全部删除（含跨集号种子如 `S01E01-E05` 的整包覆盖判定）
+- **删数据 + 退出做种**：删除的剧集种子连同数据文件一起从下载器移除（Transmission RPC 直连 / qBittorrent 均支持），释放磁盘与做种资源
+- **防止重复下载（核心）**：删除的集号写入订阅 `note`（已下载集 JSON 列表）。MoviePilot 的搜索与刷新通道都会把 `note` 中的集号当作"已下载过"而从缺失集中剔除，因此这些旧集不会再次通过订阅重新下载（而非只是改缺失计数）
+- **媒体库硬链接联动**：删除数据文件的种子按 `download_hash` 精确匹配转移记录，同步清理媒体库硬链接文件与转移记录；媒体文件带双重保护（仍被其他来源整理共享或硬链接数 >1 时只删记录不删文件，外部存储不动文件），删除后自动向上清理空目录
+- **安全删除**：删除前回收站备份（qB 导出 .torrent / TR 记录磁力链，支持恢复）；含未完成（下载/校验中）的剧集种子自动跳过；数据仍被删除范围之外种子引用时整条保留
+- **归属匹配**：默认按订阅名 + 订阅 keyword 匹配种子，另可配置额外匹配词（发布名与订阅名不一致时可补充）；支持季过滤（配置季或订阅季）
+- **触发方式**：配置 Cron 定期自动清理（可关，改为仅分析通知 + 页面手动执行）；页面支持「扫描分析」预览待清理旧集与释放空间、「执行清理」
+- **通知**：飞书 Webhook 或系统消息
+
+**配置项**：启用、指定订阅（下拉）、保留最新几集、季（可选）、额外匹配词、执行周期（Cron）、删除数据文件并退出做种、同步清理媒体库硬链接与转移记录、删除前备份开关、含未完成种子跳过、定时自动清理、飞书 Webhook、通知前缀、自定义下载器、立即运行一次。
+
+**依赖**：MoviePilot v2（SubscribeOper 读写订阅 note + DownloaderHelper + Transmission RPC / qbittorrentapi）。防止重下的机制依赖 MoviePilot 订阅的 `note`（已下载集）字段被搜索/刷新通道读取，MoviePilot 官方原版与主流二开版本均适用。
+
+---
+
 ## 安装方式
 
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/`、`sitedeletedtorrentcleaner/` 和 `crossseedcleaner/` 六个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/`、`sitedeletedtorrentcleaner/`、`crossseedcleaner/` 和 `subscribeepisodecleaner/` 七个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`、`CrossSeedCleaner`
+    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`、`CrossSeedCleaner`、`SubscribeEpisodeCleaner`
 4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
@@ -143,4 +164,5 @@
 - 源码不含任何个人配置（Webhook、Token 等均在安装后由配置页面填写）
 - 豆瓣数据接口为 MoviePilot 内置模块，无需额外 Key；Bangumi 无需 Key
 - 兼容性：基于 MoviePilot v2 API 开发；MoviePilot v3（新架构）可能需要适配
+
 
