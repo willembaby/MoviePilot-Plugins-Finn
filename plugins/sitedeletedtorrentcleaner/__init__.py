@@ -37,7 +37,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -58,6 +58,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
     _group_by = "site"            # 展示分组方式：site=按站点 / downloader=按下载器
     _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
+    _recycle_retention_days = 30  # 回收站备份保留天数（超过自动清理，0=永不清理）（v1.7）
     _scheduler = None
     _sel = []                     # 当前勾选的条目 id
     _site_map_cache = None        # 站点域名→站点名 缓存
@@ -80,6 +81,10 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             if self._group_by not in ("site", "downloader"):
                 self._group_by = "site"
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
+            try:
+                self._recycle_retention_days = max(int(config.get("recycle_retention_days") or 30), 0)
+            except Exception:
+                self._recycle_retention_days = 30
         self._sel = []
 
         self.__stop_service()
@@ -129,6 +134,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
             {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
             {"path": "/recycle_clear", "endpoint": self.recycle_clear_api, "methods": ["GET"], "summary": "清空回收站"},
+            {"path": "/clean_recycle", "endpoint": self.clean_recycle_api, "methods": ["GET"], "summary": "清理回收站过期备份（按保留天数）"},
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -162,8 +168,10 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复，关闭后删除不可恢复）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'recycle_retention_days', 'label': '回收站备份保留天数（超期自动清理，0=永不清理）', 'placeholder': '30'}}]},
                         ]
                     },
                     {
@@ -220,7 +228,8 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "keywords": "unregistered\nnot found\nnot registered\nnot authorized\nunauthorized\nnot exist\n不存在\n已删除\ndeleted\nmissing",
             "custom_downloaders": "",
             "group_by": "site",
-            "recycle_enabled": True
+            "recycle_enabled": True,
+            "recycle_retention_days": 30
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -429,6 +438,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             "custom_downloaders": self._custom_downloaders,
             "group_by": self._group_by,
             "recycle_enabled": self._recycle_enabled,
+            "recycle_retention_days": self._recycle_retention_days,
         })
 
     # ==================== 工具 ====================
@@ -811,36 +821,51 @@ class SiteDeletedTorrentCleaner(_PluginBase):
 
     def _schedule_scan(self):
         """定时任务入口"""
+        rec_stats = self._clean_recycle()  # v1.7：回收站过期备份自动清理
         dead_items, _ = self._scan_all()
+        rec_line = self._recycle_line(rec_stats)
         if not self._auto_delete:
             self.save_data("result", {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                       "items": dead_items, "total": len(dead_items)})
             logger.info(f"站点已删除种子清理：定时扫描完成，发现 {len(dead_items)} 个死种")
-            if self._notify and dead_items:
-                self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-扫描发现 {len(dead_items)} 个死种\n"
-                                        + "\n".join(f"  ▶ {x.get('name')}" for x in dead_items[:20]))
+            if self._notify and (dead_items or rec_line):
+                text = f"{self._notify_title_prefix}: 站点已删除种子清理-扫描发现 {len(dead_items)} 个死种\n"
+                text += "\n".join(f"  ▶ {x.get('name')}" for x in dead_items[:20])
+                if rec_line:
+                    text += "\n" + rec_line
+                self._send_notification(text)
             return
         if dead_items:
             ok, _ = self._delete_entries(dead_items)
             logger.info(f"站点已删除种子清理：自动删除完成，成功 {ok}/{len(dead_items)}")
             if self._notify:
-                self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-自动删除 {ok}/{len(dead_items)} 个死种")
+                text = f"{self._notify_title_prefix}: 站点已删除种子清理-自动删除 {ok}/{len(dead_items)} 个死种"
+                if rec_line:
+                    text += "\n" + rec_line
+                self._send_notification(text)
         else:
             logger.info("站点已删除种子清理：定时扫描完成，未发现死种")
+            if self._notify and rec_line:
+                self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-回收站维护\n" + rec_line)
 
     def scan_api(self) -> Dict[str, Any]:
         """手动扫描"""
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
         logger.info("站点已删除种子清理：开始扫描下载器死种...")
+        rec_stats = self._clean_recycle()  # v1.7：手动扫描同样顺带清理回收站过期备份
         dead_items, _ = self._scan_all()
         self.save_data("result", {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                   "items": dead_items, "total": len(dead_items)})
         self._sel = []
         logger.info(f"站点已删除种子清理：扫描完成，共 {len(dead_items)} 个死种")
-        if self._notify and dead_items:
-            self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-扫描完成\n"
-                                    f"发现 {len(dead_items)} 个死种，请到插件页面查看/删除")
+        if self._notify and (dead_items or (rec_stats and rec_stats.get("removed"))):
+            text = f"{self._notify_title_prefix}: 站点已删除种子清理-扫描完成\n"
+            text += f"发现 {len(dead_items)} 个死种，请到插件页面查看/删除"
+            rec_line = self._recycle_line(rec_stats)
+            if rec_line:
+                text += "\n" + rec_line
+            self._send_notification(text)
         return {"success": True, "total": len(dead_items), "items": dead_items}
 
     # ==================== 勾选 ====================
@@ -1045,6 +1070,70 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         if saved:
             self.save_data("recycle", rec)
             logger.info(f"站点已删除种子清理：已备份 {sum(1 for _ in rec)} 条回收站记录")
+
+    def _clean_recycle(self) -> Optional[Dict[str, int]]:
+        """回收站过期备份自动清理（v1.7）：删除时间超过保留天数的备份条目与 .torrent 文件。
+        保留天数 <=0 表示永不清理；备份关闭时跳过。
+        返回 {"removed": 清理条数, "torrent_files": 删除的种子文件数, "remaining": 剩余条数}，未启用返回 None"""
+        if not self._recycle_enabled or self._recycle_retention_days <= 0:
+            return None
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            return None
+        if not rec:
+            return {"removed": 0, "torrent_files": 0, "remaining": 0}
+        now = datetime.now()
+        cutoff = now - timedelta(days=self._recycle_retention_days)
+        removed = 0
+        torrent_files = 0
+        rdir = None
+        for key in list(rec.keys()):
+            info = rec.get(key) or {}
+            try:
+                deleted_at = datetime.strptime(str(info.get("deleted_at") or ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue  # 无删除时间无法解析则保守保留
+            if deleted_at >= cutoff:
+                continue
+            if info.get("bk_type") == "torrent" and info.get("bk_file"):
+                try:
+                    if rdir is None:
+                        rdir = self._recycle_dir()
+                    fp = os.path.join(rdir, str(info["bk_file"]))
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception as e:
+                    logger.warning(f"站点已删除种子清理：删除回收站备份文件失败（{info.get('bk_file')}）：{e}")
+                torrent_files += 1
+            rec.pop(key, None)
+            removed += 1
+        if removed:
+            self.save_data("recycle", rec)
+            logger.info(f"站点已删除种子清理：回收站自动清理完成：删除过期备份 {removed} 条"
+                        f"（含 .torrent 文件 {torrent_files} 个），剩余 {len(rec)} 条，保留天数 {self._recycle_retention_days}")
+        return {"removed": removed, "torrent_files": torrent_files, "remaining": len(rec)}
+
+    def _recycle_line(self, rec_stats: Optional[Dict[str, int]]) -> str:
+        """通知用回收站维护摘要行（无清理时不显示）"""
+        if rec_stats and rec_stats.get("removed"):
+            return (f"回收站维护：清理过期备份 {rec_stats['removed']} 条"
+                    f"（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
+        return ""
+
+    def clean_recycle_api(self) -> Dict[str, Any]:
+        """手动触发回收站过期清理（API）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        stats = self._clean_recycle()
+        if stats is None:
+            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
+        return {"success": True, "removed": stats.get("removed", 0),
+                "torrent_files": stats.get("torrent_files", 0),
+                "remaining": stats.get("remaining", 0),
+                "retention_days": self._recycle_retention_days,
+                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
+                            if stats.get("removed") else "无过期备份")}
 
     def restore_api(self, id: str = "") -> Dict[str, Any]:
         """从回收站恢复误删种子：重新添加（含原保存路径）→ 重新校验 → 开始任务"""
