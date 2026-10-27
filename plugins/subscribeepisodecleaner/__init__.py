@@ -8,7 +8,7 @@
 - 删除的剧集号写入订阅 note（已下载集 JSON 列表），MoviePilot 搜索/刷新时将其视为
   「已下载过」而从缺失集中剔除，不会通过订阅再次重新下载
 - 删除时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护，复用跨站清理模式）
-- 删除前回收站备份（支持误删恢复）、含未完成种子跳过、按下载器分批删除
+- 删除前回收站备份（支持误删恢复）、回收站过期备份按保留天数自动清理（v1.6，0=永不清理）、含未完成种子跳过、按下载器分批删除
 - 定时自动执行 + 页面手动触发，飞书 Webhook 或系统消息通知
 """
 
@@ -108,9 +108,9 @@ class SubscribeEpisodeCleaner(_PluginBase):
     plugin_desc = ("指定 MoviePilot 多个电视剧订阅（多选），按设定的 Cron 定期清理各订阅已下载剧集、只保留最新 N 集（各订阅独立计算）；"
                    "删除时退出做种并清理数据文件，同步清理媒体库硬链接与转移记录；"
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
-                   "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
+                   "不会通过订阅再次重新下载；含未完成保护、回收站备份自动过期清理、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -130,6 +130,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
     _delete_file = True          # 删除数据文件 + 退出做种（本插件核心行为）
     _clean_media_links = True    # 同步清理媒体库硬链接与转移记录
     _recycle_enabled = True      # 删除前备份种子到回收站
+    _recycle_retention_days = 30 # 回收站备份保留天数（超过自动清理，0=永不清理）（v1.6）
     _skip_active = True          # 含未完成（下载/校验中）的种子跳过
     _auto = True                 # 定时执行后自动清理（否则仅分析通知）
     _notify = True
@@ -167,6 +168,10 @@ class SubscribeEpisodeCleaner(_PluginBase):
             self._delete_file = bool(config.get("delete_file", True))
             self._clean_media_links = bool(config.get("clean_media_links", True))
             self._recycle_enabled = bool(config.get("recycle_enabled", True))
+            try:
+                self._recycle_retention_days = max(int(config.get("recycle_retention_days") or 30), 0)
+            except Exception:
+                self._recycle_retention_days = 30
             self._skip_active = bool(config.get("skip_active", True))
             self._auto = bool(config.get("auto", True))
             self._notify = bool(config.get("notify", True))
@@ -214,6 +219,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
             {"path": "/scan", "endpoint": self.scan_api, "methods": ["GET"], "summary": "扫描分析应清理的旧集"},
             {"path": "/run", "endpoint": self.run_api, "methods": ["GET"], "summary": "执行清理（删数据+退出做种+写note防重下）"},
             {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空分析结果"},
+            {"path": "/clean_recycle", "endpoint": self.clean_recycle_api, "methods": ["GET"], "summary": "清理回收站过期备份（按保留天数）"},
         ]
 
     # ==================== 表单 ====================
@@ -264,7 +270,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                          'content': [{'component': 'VSwitch', 'props': {'model': 'clean_media_links', 'label': '同步清理媒体库硬链接与转移记录'}}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
-                         'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复）'}}]},
+                         'content': [{'component': 'VTextField', 'props': {'model': 'recycle_retention_days', 'label': '回收站备份保留天数（超期自动清理，0=永不清理）', 'placeholder': '30'}}]},
                     ]},
                     {'component': 'VRow', 'content': [
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
@@ -285,6 +291,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     {'component': 'VRow', 'content': [
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                          'content': [{'component': 'VTextField', 'props': {'model': 'notify_title_prefix', 'label': '通知前缀', 'placeholder': 'HA通知'}}]},
+                        {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                         'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复）'}}]},
                     ]},
                     {'component': 'VRow', 'content': [
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
@@ -313,6 +321,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "delete_file": True,
             "clean_media_links": True,
             "recycle_enabled": True,
+            "recycle_retention_days": 30,
             "skip_active": True,
             "auto": True,
             "notify": True,
@@ -1064,6 +1073,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             logger.warning(f"订阅剧集自动清理：完结附属清理失败：{e}")
 
     def _schedule_run(self):
+        # 回收站过期备份自动清理（v1.6：无论是否有活跃订阅都执行）
+        rec_stats = self._clean_recycle()
         subs = []
         missing = []
         for sid in self._subscribe_ids:
@@ -1085,6 +1096,12 @@ class SubscribeEpisodeCleaner(_PluginBase):
             self._snapshot_registry(subs)
         if not subs:
             logger.info("订阅剧集自动清理：当前没有待管理的活跃订阅（可能全部完结已处理）")
+            # 无活跃订阅时，若回收站有过期清理也发简短通知（v1.6）
+            if self._notify and rec_stats and rec_stats.get("removed"):
+                self._send_notification(
+                    f"{self._notify_title_prefix}: 订阅剧集自动清理-回收站维护\n"
+                    f"清理过期备份 {rec_stats['removed']} 条（保留 {self._recycle_retention_days} 天），"
+                    f"剩余 {rec_stats['remaining']} 条")
             return
         items = self._scan_all()
         agg = self._analyze_all(subs, items)
@@ -1093,9 +1110,9 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     f"待清理 {len(agg['candidates'])}（释放 {self._fmt_size(agg['free_size'])}）")
         if self._auto and agg.get("candidates"):
             ok, kept, t_stats, o_stats = self._execute(agg["candidates"])
-            # 定时自动清理也发执行回执（v1.4）
+            # 定时自动清理也发执行回执（v1.4，v1.6 带回收站清理统计）
             if self._notify:
-                self._send_exec_notification(ok, kept, t_stats, o_stats, len(agg["candidates"]))
+                self._send_exec_notification(ok, kept, t_stats, o_stats, len(agg["candidates"]), rec_stats)
         elif self._notify and agg.get("candidates"):
             lines = []
             for r in (agg.get("subs") or []):
@@ -1111,6 +1128,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             return {"success": False, "message": "插件未启用"}
         if not self._subscribe_ids:
             return {"success": False, "message": "未选择订阅"}
+        # 手动扫描同样顺带执行回收站过期清理（v1.6）
+        rec_stats = self._clean_recycle()
         subs = []
         missing = []
         for sid in self._subscribe_ids:
@@ -1147,6 +1166,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 lines.append(f"▶ 《{sub.get('name')}》第{sub.get('season')}季："
                              f"保留 {self._eps_text(kept_eps) or '无'}，剔除 {len(drop_eps)} 集"
                              + (f"，待清理 {cands} 个种子（{self._fmt_size(r.get('free_size', 0))}）" if cands else "，无待清理"))
+            if rec_stats and rec_stats.get("removed"):
+                lines.append(f"回收站维护：清理过期备份 {rec_stats['removed']} 条（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
             text = (f"{self._notify_title_prefix}: 订阅剧集自动清理-扫描完成\n"
                     f"共 {len(subs)} 个订阅，待清理 {len(agg.get('candidates') or [])} 个种子，"
                     f"释放约 {self._fmt_size(agg.get('free_size', 0))}\n" + "\n".join(lines))
@@ -1167,15 +1188,17 @@ class SubscribeEpisodeCleaner(_PluginBase):
         if not candidates:
             return {"success": False, "message": "无待清理结果，请先扫描分析"}
         ok, kept, t_stats, o_stats = self._execute(candidates)
+        # 执行清理后顺带维护回收站（v1.6：刚写入的新备份不会过期，仅清旧备份）
+        rec_stats = self._clean_recycle()
         # 执行回执通知（v1.4：每次执行后必发，含删除/释放/防重下汇总）
         if self._notify:
-            self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates))
+            self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates), rec_stats)
         return {"success": True, "ok": ok, "total": len(candidates),
                 "kept": len(kept), "transfer": t_stats, "orphan": o_stats}
 
     def _send_exec_notification(self, ok: int, kept: List[str], t_stats: Dict[str, int],
-                                 o_stats: Dict[str, int], total: int):
-        """执行清理后发送回执通知（v1.4）"""
+                                 o_stats: Dict[str, int], total: int, rec_stats: Optional[Dict[str, int]] = None):
+        """执行清理后发送回执通知（v1.4；v1.6 附带回收站清理统计）"""
         lines = [f"清理完成：删除种子任务 {ok} 个（含辅种级联）"]
         if kept:
             lines.append(f"因数据共享保留：{len(kept)} 个")
@@ -1184,6 +1207,9 @@ class SubscribeEpisodeCleaner(_PluginBase):
                          + (f" / 跳过 {t_stats.get('skipped', 0)} 个" if t_stats.get('skipped') else ""))
         if o_stats:
             lines.append(f"旧集媒体清理：视频及附属 {o_stats.get('files', 0)} 个 / 转移记录 {o_stats.get('records', 0)} 条")
+        if rec_stats and rec_stats.get("removed"):
+            lines.append(f"回收站维护：清理过期备份 {rec_stats['removed']} 条"
+                         f"（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
         saved = self.get_data("result") or {}
         sub_lines = []
         for r in (saved.get("subs") or []):
@@ -1567,11 +1593,68 @@ class SubscribeEpisodeCleaner(_PluginBase):
         if dirty:
             self.save_data("recycle", rec)
 
+    def _clean_recycle(self) -> Optional[Dict[str, int]]:
+        """回收站过期备份自动清理（v1.6）：删除删除时间超过保留天数的备份条目与 .torrent 文件。
+        保留天数 <=0 表示永不清理；回收站备份关闭时跳过。
+        返回 {"removed": 清理条数, "torrent_files": 删除的种子文件数, "remaining": 剩余条数}，未启用返回 None"""
+        if not self._recycle_enabled or self._recycle_retention_days <= 0:
+            return None
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            return None
+        if not rec:
+            return {"removed": 0, "torrent_files": 0, "remaining": 0}
+        now = datetime.now()
+        cutoff = now - timedelta(days=self._recycle_retention_days)
+        removed = 0
+        torrent_files = 0
+        rdir = None
+        for key in list(rec.keys()):
+            info = rec.get(key) or {}
+            try:
+                deleted_at = datetime.strptime(str(info.get("deleted_at") or ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                # 无删除时间的旧条目按最早兜底时间处理，无法解析则保守保留
+                continue
+            if deleted_at >= cutoff:
+                continue
+            # 删除磁盘上的 .torrent 备份文件
+            if info.get("bk_type") == "torrent" and info.get("bk_file"):
+                try:
+                    if rdir is None:
+                        rdir = self._recycle_dir()
+                    fp = os.path.join(rdir, str(info["bk_file"]))
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception as e:
+                    logger.warning(f"订阅剧集自动清理：删除回收站备份文件失败（{info.get('bk_file')}）：{e}")
+                torrent_files += 1
+            rec.pop(key, None)
+            removed += 1
+        if removed:
+            self.save_data("recycle", rec)
+            logger.info(f"订阅剧集自动清理：回收站自动清理完成：删除过期备份 {removed} 条"
+                        f"（含 .torrent 文件 {torrent_files} 个），剩余 {len(rec)} 条，保留天数 {self._recycle_retention_days}")
+        return {"removed": removed, "torrent_files": torrent_files, "remaining": len(rec)}
+
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
             return {"success": False, "message": "请确认参数 confirm=yes"}
         self.save_data("result", {})
         return {"success": True}
+
+    def clean_recycle_api(self) -> Dict[str, Any]:
+        """手动触发回收站过期清理（API）"""
+        stats = self._clean_recycle()
+        if stats is None:
+            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
+        return {"success": True, "removed": stats.get("removed", 0),
+                "torrent_files": stats.get("torrent_files", 0),
+                "remaining": stats.get("remaining", 0),
+                "retention_days": self._recycle_retention_days,
+                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
+                            if stats.get("removed") else "无过期备份")}
 
     # ==================== 通知与停止 ====================
 
@@ -1602,6 +1685,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "delete_file": self._delete_file,
             "clean_media_links": self._clean_media_links,
             "recycle_enabled": self._recycle_enabled,
+            "recycle_retention_days": self._recycle_retention_days,
             "skip_active": self._skip_active,
             "auto": self._auto,
             "notify": self._notify,
