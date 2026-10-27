@@ -3,7 +3,7 @@
 订阅剧集自动清理插件 (SubscribeEpisodeCleaner)
 
 功能：
-- 针对 MoviePilot「指定某个订阅电视剧」定期（可设 Cron）清理已下载的剧集
+- 针对 MoviePilot「指定的多个订阅电视剧」（可多选）定期（可设 Cron）清理已下载的剧集
 - 只保留最新 N 集（按集号最大），更早的剧集连同下载器数据一起删除（删数据文件 + 退出做种）
 - 删除的剧集号写入订阅 note（已下载集 JSON 列表），MoviePilot 搜索/刷新时将其视为
   「已下载过」而从缺失集中剔除，不会通过订阅再次重新下载
@@ -105,12 +105,12 @@ class SubscribeEpisodeCleaner(_PluginBase):
     """
 
     plugin_name = "订阅剧集自动清理"
-    plugin_desc = ("指定 MoviePilot 某电视剧订阅，按设定的 Cron 定期清理已下载剧集、只保留最新 N 集；"
+    plugin_desc = ("指定 MoviePilot 多个电视剧订阅（多选），按设定的 Cron 定期清理各订阅已下载剧集、只保留最新 N 集（各订阅独立计算）；"
                    "删除时退出做种并清理数据文件，同步清理媒体库硬链接与转移记录；"
-                   "删除的集号写入订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
+                   "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -121,7 +121,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
     _enabled = False
     _onlyonce = False
     _cron = "0 3 * * *"
-    _subscribe_id = ""           # 指定订阅 ID
+    _subscribe_ids = []         # 指定订阅 ID 列表（多选）
     _keep_episodes = 5           # 保留最新几集
     _season = ""                 # 覆盖季（留空用订阅自带季）
     _match_keywords = ""         # 额外匹配词（每行一个，种子名命中任一即归属该订阅）
@@ -143,7 +143,14 @@ class SubscribeEpisodeCleaner(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._onlyonce = config.get("onlyonce", False) or False
             self._cron = config.get("cron") or "0 3 * * *"
-            self._subscribe_id = str(config.get("subscribe_id") or "").strip()
+            # 订阅多选（兼容旧版单选字符串自动迁移为列表）
+            raw_ids = config.get("subscribe_ids")
+            if raw_ids is None:
+                old = str(config.get("subscribe_id") or "").strip()
+                raw_ids = [old] if old else []
+            if isinstance(raw_ids, str):
+                raw_ids = [raw_ids] if raw_ids.strip() else []
+            self._subscribe_ids = [str(x).strip() for x in (raw_ids or []) if str(x).strip()]
             try:
                 self._keep_episodes = max(int(config.get("keep_episodes") or 5), 1)
             except Exception:
@@ -254,7 +261,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     ]},
                     {'component': 'VRow', 'content': [
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                         'content': [{'component': 'VSelect', 'props': {'model': 'subscribe_id', 'label': '指定订阅（电视剧）', 'items': sub_items, 'clearable': True}}]},
+                         'content': [{'component': 'VSelect', 'props': {'model': 'subscribe_ids', 'label': '指定订阅（电视剧，可多选）', 'items': sub_items, 'multiple': True, 'chips': True, 'clearable': True}}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                          'content': [{'component': 'VTextField', 'props': {'model': 'keep_episodes', 'label': '保留最新几集', 'placeholder': '5'}}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
@@ -284,7 +291,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "enabled": False,
             "onlyonce": False,
             "cron": "0 3 * * *",
-            "subscribe_id": "",
+            "subscribe_ids": [],
             "keep_episodes": 5,
             "season": "",
             "match_keywords": "",
@@ -306,18 +313,15 @@ class SubscribeEpisodeCleaner(_PluginBase):
             return [{'component': 'VAlert', 'props': {'type': 'warning', 'text': '插件未启用，请先到「设置」页启用', 'variant': 'tonal'}}]
 
         saved = self.get_data("result") or {}
-        sub = saved.get("sub") or {}
+        subs_results = saved.get("subs") or []
         scan_time = saved.get("time", "")
         candidates = saved.get("candidates") or []
-        keep_eps = saved.get("keep_eps") or []
-        drop_eps = saved.get("drop_eps") or []
 
         page = []
         page.append({
             'component': 'VAlert',
             'props': {'type': 'info', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
-                      'text': (f"订阅：{sub.get('name', '-')}（{sub.get('year', '-')}）第{sub.get('season', '-')}季"
-                               f" 分析时间：{scan_time or '尚未分析'}")}
+                      'text': (f"已选 {len(self._subscribe_ids)} 个订阅 · 分析时间：{scan_time or '尚未分析'}")}
         })
         page.append({
             'component': 'VRow',
@@ -334,36 +338,46 @@ class SubscribeEpisodeCleaner(_PluginBase):
             ]
         })
 
-        if not candidates:
+        if not subs_results:
             page.append({'component': 'VAlert',
-                         'props': {'type': 'success', 'variant': 'tonal',
-                                   'text': (f"当前无待清理旧集。保留最新 {self._keep_episodes} 集："
-                                            f"{self._eps_text(keep_eps) or '暂无'}"
-                                            + (f"；已剔除不重下集：{self._eps_text(drop_eps)}" if drop_eps else ""))}})
+                         'props': {'type': 'info', 'variant': 'tonal',
+                                   'text': '尚未分析，点击「扫描分析」查看各订阅待清理的旧集。'}})
             return page
 
-        page.append({
-            'component': 'VAlert',
-            'props': {'type': 'warning', 'variant': 'tonal',
-                      'text': (f"待清理 {len(candidates)} 个种子，释放约 {self._fmt_size(saved.get('free_size', 0))}；"
-                               f"保留最新 {self._keep_episodes} 集（集号 {self._eps_text(keep_eps)}）；"
-                               f"删除后这些旧集号将写入订阅 note，不再重新下载。")}
-        })
-
-        for e in candidates[:200]:
-            page.append({
-                'component': 'VRow',
-                'props': {'class': 'pa-0 ma-0 ml-2', 'align': 'center', 'dense': True},
-                'content': [
-                    {'component': 'VCol', 'props': {'cols': True},
-                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
-                                  'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:70]}"
-                                          f"（集 {self._eps_text(e.get('eps', []))}）"}]},
-                    {'component': 'VCol', 'props': {'cols': 'auto'},
-                     'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'orange', 'variant': 'tonal'},
-                                  'text': self._fmt_size(e.get('size', 0))}]},
-                ]
-            })
+        for r in subs_results:
+            sub = r.get("sub") or {}
+            cands = r.get("candidates") or []
+            keep_eps = r.get("keep_eps") or []
+            drop_eps = r.get("drop_eps") or []
+            title = f"《{sub.get('name', '-')}》（{sub.get('year', '-')}）第{sub.get('season', '-')}季"
+            if cands:
+                page.append({
+                    'component': 'VAlert',
+                    'props': {'type': 'warning', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-1',
+                              'text': (f"{title}：待清理 {len(cands)} 个种子，释放约 {self._fmt_size(r.get('free_size', 0))}；"
+                                       f"保留最新 {self._keep_episodes} 集（{self._eps_text(keep_eps) or '无'}），"
+                                       f"剔除集 {self._eps_text(drop_eps) or '无'} 将写入订阅不再重下。")}
+                })
+                for e in cands[:100]:
+                    page.append({
+                        'component': 'VRow',
+                        'props': {'class': 'pa-0 ma-0 ml-2', 'align': 'center', 'dense': True},
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': True},
+                             'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                                          'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:70]}"
+                                                  f"（集 {self._eps_text(e.get('eps', []))}）"}]},
+                            {'component': 'VCol', 'props': {'cols': 'auto'},
+                             'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'orange', 'variant': 'tonal'},
+                                          'text': self._fmt_size(e.get('size', 0))}]},
+                        ]
+                    })
+            else:
+                page.append({'component': 'VAlert',
+                             'props': {'type': 'success', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-1',
+                                       'text': (f"{title}：无待清理旧集。保留最新 {self._keep_episodes} 集："
+                                                f"{self._eps_text(keep_eps) or '暂无'}"
+                                                + (f"；已剔除不重下集：{self._eps_text(drop_eps)}" if drop_eps else ""))}})
 
         return page
 
@@ -678,44 +692,78 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "free_size": free_size,
         }
 
+    def _analyze_all(self, subs: List[Dict[str, Any]], items: Dict[str, dict]) -> Dict[str, Any]:
+        """对多个订阅逐个分析并汇总（保留窗口按各订阅独立计算），候选种子合并去重。"""
+        results = []
+        for sub in subs:
+            try:
+                results.append(self._analyze(sub, items))
+            except Exception as e:
+                logger.error(f"订阅剧集自动清理：分析订阅《{sub.get('name')}》失败：{e}")
+        candidates = []
+        seen = set()
+        for r in results:
+            for c in (r.get("candidates") or []):
+                if c.get("id") not in seen:
+                    seen.add(c.get("id"))
+                    candidates.append(c)
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_torrents": len(items),
+            "subs": results,
+            "candidates": candidates,
+            "free_size": sum(int(c.get("size") or 0) for c in candidates),
+        }
+
     def _schedule_run(self):
-        sub = self._load_subscribe(self._subscribe_id)
-        if not sub:
-            logger.warning(f"订阅剧集自动清理：订阅不存在（ID={self._subscribe_id}），请检查配置")
+        subs = []
+        for sid in self._subscribe_ids:
+            s = self._load_subscribe(sid)
+            if s:
+                subs.append(s)
+            else:
+                logger.warning(f"订阅剧集自动清理：订阅不存在（ID={sid}）")
+        if not subs:
+            logger.warning("订阅剧集自动清理：未选择有效订阅，请检查配置")
             if self._notify:
-                self._send_notification(f"{self._notify_title_prefix}: 订阅剧集自动清理-订阅不存在"
-                                        f"（ID={self._subscribe_id}），请检查配置")
+                self._send_notification(f"{self._notify_title_prefix}: 订阅剧集自动清理-未选择有效订阅，请检查配置")
             return
         items = self._scan_all()
-        result = self._analyze(sub, items)
-        self.save_data("result", result)
-        logger.info(f"订阅剧集自动清理：分析完成《{sub.get('name')}》第{sub.get('season')}季 "
-                    f"种子 {result['total_torrents']} 匹配 {result['matched_torrents']} "
-                    f"待清理 {len(result['candidates'])}（释放 {self._fmt_size(result['free_size'])}）")
-        if self._auto and result.get("candidates"):
-            self._execute(result["candidates"])
-        elif self._notify and result.get("candidates"):
+        agg = self._analyze_all(subs, items)
+        self.save_data("result", agg)
+        logger.info(f"订阅剧集自动清理：分析完成，共 {len(subs)} 个订阅，种子 {agg['total_torrents']}，"
+                    f"待清理 {len(agg['candidates'])}（释放 {self._fmt_size(agg['free_size'])}）")
+        if self._auto and agg.get("candidates"):
+            self._execute(agg["candidates"])
+        elif self._notify and agg.get("candidates"):
+            lines = []
+            for r in (agg.get("subs") or []):
+                if r.get("candidates"):
+                    lines.append(f"▶ 《{r['sub'].get('name')}》待清理 {len(r['candidates'])} 个旧集"
+                                 f"（保留最新 {self._keep_episodes} 集：{self._eps_text(r.get('keep_eps'))}）")
             self._send_notification(
-                f"{self._notify_title_prefix}: 订阅剧集自动清理-《{sub.get('name')}》发现 {len(result['candidates'])} 个旧集待清理"
-                f"（{self._fmt_size(result['free_size'])}）\n"
-                f"保留最新 {self._keep_episodes} 集：{self._eps_text(result['keep_eps'])}\n"
-                f"请到插件页面执行清理")
+                f"{self._notify_title_prefix}: 订阅剧集自动清理-发现 {len(agg['candidates'])} 个旧集待清理"
+                f"（{self._fmt_size(agg['free_size'])}）\n" + "\n".join(lines) + "\n请到插件页面执行清理")
 
     def scan_api(self) -> Dict[str, Any]:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
-        if not self._subscribe_id:
-            return {"success": False, "message": "未配置指定订阅"}
-        sub = self._load_subscribe(self._subscribe_id)
-        if not sub:
-            return {"success": False, "message": f"订阅不存在（ID={self._subscribe_id}）"}
+        if not self._subscribe_ids:
+            return {"success": False, "message": "未选择订阅"}
+        subs = []
+        for sid in self._subscribe_ids:
+            s = self._load_subscribe(sid)
+            if s:
+                subs.append(s)
+        if not subs:
+            return {"success": False, "message": "所选订阅均不存在"}
         items = self._scan_all()
-        result = self._analyze(sub, items)
-        self.save_data("result", result)
-        logger.info(f"订阅剧集自动清理：扫描完成《{sub.get('name')}》待清理 {len(result['candidates'])} 个种子")
-        return {"success": True, "sub": sub.get("name"),
-                "matched": result["matched_torrents"], "candidates": len(result["candidates"]),
-                "free_size": result["free_size"]}
+        agg = self._analyze_all(subs, items)
+        self.save_data("result", agg)
+        logger.info(f"订阅剧集自动清理：扫描完成，共 {len(subs)} 个订阅，待清理 {len(agg['candidates'])} 个种子")
+        return {"success": True, "subs": len(subs),
+                "candidates": len(agg["candidates"]),
+                "free_size": agg["free_size"]}
 
     # ==================== 执行清理 ====================
 
@@ -734,7 +782,14 @@ class SubscribeEpisodeCleaner(_PluginBase):
 
     def _execute(self, candidates: List[Dict]) -> Tuple[int, List[str], Dict[str, int]]:
         """执行删除：按下载器分批删数据+退出做种，备份回收站，清理媒体库硬链接与转移记录；
-        更新订阅 note 防重下。返回 (成功数, 仅删任务提示, 整理联动统计)"""
+        更新各订阅 note 防重下。返回 (成功数, 仅删任务提示, 整理联动统计)"""
+        # 多订阅可能命中同一种子，按种子 ID 去重
+        uniq: Dict[str, Dict] = {}
+        for c in candidates:
+            key = c.get("id") or f"{c.get('downloader')}|{c.get('hash')}"
+            if key not in uniq:
+                uniq[key] = c
+        candidates = list(uniq.values())
         ok = 0
         kept: List[str] = []
         del_data_hashes: List[str] = []
@@ -797,6 +852,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             saved = self.get_data("result") or {}
             del_ids = {c.get("id") for c in candidates}
             saved["candidates"] = [c for c in saved.get("candidates", []) if c.get("id") not in del_ids]
+            for r in (saved.get("subs") or []):
+                r["candidates"] = [c for c in (r.get("candidates") or []) if c.get("id") not in del_ids]
             self.save_data("result", saved)
         except Exception:
             pass
@@ -810,37 +867,44 @@ class SubscribeEpisodeCleaner(_PluginBase):
         return ok, kept, t_stats
 
     def _mark_episodes_done(self):
-        """把本次剔除的集号写入订阅 note（JSON 列表），MP 将其视为已下载不再补下。"""
-        sub = self._load_subscribe(self._subscribe_id)
-        if not sub:
-            return
+        """把每个订阅本次剔除的集号写入各自订阅 note（JSON 列表），MP 将其视为已下载不再补下。"""
         saved = self.get_data("result") or {}
-        drop_eps = saved.get("drop_eps") or []
-        if not drop_eps:
+        subs_results = saved.get("subs") or []
+        if not subs_results:
             return
         try:
             from app.db.subscribe_oper import SubscribeOper
         except Exception as e:
             logger.error(f"订阅剧集自动清理：无法访问订阅库：{e}")
             return
-        note = []
-        raw = sub.get("note") or ""
-        if raw:
+        oper = SubscribeOper()
+        for r in subs_results:
+            sub_info = r.get("sub") or {}
+            drop_eps = r.get("drop_eps") or []
+            sid = sub_info.get("id")
+            if not sid or not drop_eps:
+                continue
+            s = self._load_subscribe(sid)
+            if not s:
+                continue
+            note = []
+            raw = s.get("note") or ""
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        note = [int(x) for x in parsed if str(x).isdigit()]
+                    elif isinstance(parsed, int):
+                        note = [parsed]
+                except Exception:
+                    note = []
+            merged = sorted(set(note) | set(int(x) for x in drop_eps))
             try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    note = [int(x) for x in parsed if str(x).isdigit()]
-                elif isinstance(parsed, int):
-                    note = [parsed]
-            except Exception:
-                note = []
-        merged = sorted(set(note) | set(int(x) for x in drop_eps))
-        try:
-            SubscribeOper().update(sub.get("id"), {"note": json.dumps(merged)})
-            logger.info(f"订阅剧集自动清理：《{sub.get('name')}》已把剔除集号 {self._eps_text(drop_eps)} "
-                        f"写入已下载 note，后续不再通过订阅重新下载")
-        except Exception as e:
-            logger.error(f"订阅剧集自动清理：更新订阅 note 失败：{e}")
+                oper.update(sid, {"note": json.dumps(merged)})
+                logger.info(f"订阅剧集自动清理：《{s.get('name')}》已把剔除集号 {self._eps_text(drop_eps)} "
+                            f"写入已下载 note，后续不再通过订阅重新下载")
+            except Exception as e:
+                logger.error(f"订阅剧集自动清理：更新订阅 {sid} note 失败：{e}")
 
     # ==================== 媒体库硬链接联动 ====================
 
@@ -1013,7 +1077,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
             "cron": self._cron,
-            "subscribe_id": self._subscribe_id,
+            "subscribe_ids": self._subscribe_ids,
             "keep_episodes": self._keep_episodes,
             "season": self._season,
             "match_keywords": self._match_keywords,
