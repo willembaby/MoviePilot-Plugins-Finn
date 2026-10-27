@@ -210,7 +210,9 @@ class SubscribeEpisodeCleaner(_PluginBase):
             from app.db.subscribe_oper import SubscribeOper
             items = []
             for s in (SubscribeOper().list() or []):
-                if str(getattr(s, "type", "") or "").lower() != "tv":
+                # 兼容不同版本 type 字段：tv / 电视剧 / T
+                t = str(getattr(s, "type", "") or "").lower()
+                if "剧" not in t and t not in ("tv", "电视剧", "t"):
                     continue
                 name = str(getattr(s, "name", "") or "")
                 year = str(getattr(s, "year", "") or "")
@@ -602,6 +604,8 @@ class SubscribeEpisodeCleaner(_PluginBase):
             s = int(season)
         except Exception:
             return True
+        if s <= 0:
+            return True  # 未指定有效季（如 0），不按季过滤
         t_seasons, _ = parse_episodes(torrent_name)
         if t_seasons and s not in t_seasons:
             return False
