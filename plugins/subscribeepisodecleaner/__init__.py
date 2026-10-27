@@ -110,7 +110,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -586,27 +586,108 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 "lack_episode": getattr(s, "lack_episode", 0) or 0,
                 "note": getattr(s, "note", "") or "",
                 "keyword": str(getattr(s, "keyword", "") or ""),
+                "tmdbid": getattr(s, "tmdbid", None),
                 "type": str(getattr(s, "type", "") or ""),
             }
         except Exception as e:
             logger.error(f"订阅剧集自动清理：读取订阅 {sid} 失败：{e}")
             return None
 
+    def _sub_tmdbid(self, sub: Dict[str, Any]) -> Optional[int]:
+        try:
+            v = (sub or {}).get("tmdbid")
+            return int(v) if v not in (None, "", "None") else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_hist_eps(val) -> List[int]:
+        """解析 downloadhistory.episodes 字段（如 'E182' / 'E166-E168' / 'E1,E2'）为集号列表"""
+        if not val:
+            return []
+        s = str(val)
+        eps: set = set()
+        for m in re.finditer(r"[Ee](\d{1,4})\s*-\s*[Ee]?(\d{1,4})", s):
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo and hi and lo <= hi and hi - lo < 200:
+                eps.update(range(lo, hi + 1))
+        for m in re.finditer(r"[Ee](\d{1,4})", s):
+            eps.add(int(m.group(1)))
+        return sorted(eps)
+
+    def _load_sub_aliases(self, sub: Dict[str, Any]) -> Tuple[set, Dict[str, set], Dict[str, List[int]]]:
+        """从下载历史挖掘该订阅（按 tmdbid/title 归属）的发布名别名、hash 集与 hash→集号映射：
+        - names：历史种子名去季集后缀的归一化别名（英文发布名一般与订阅中文名不同）
+        - hashes：历史 download_hash（下载器中按 hash 精确命中即归属该订阅，最可靠）
+        - hash_eps：hash → 集号列表（整季包种子的名字无集号，靠历史记录补齐）"""
+        names: set = set()
+        hashes: Dict[str, set] = {}
+        hash_eps: Dict[str, List[int]] = {}
+        tid = self._sub_tmdbid(sub)
+        title = (sub or {}).get("name") or ""
+        try:
+            from app.db import SessionFactory
+            from app.db.models.downloadhistory import DownloadHistory
+            from sqlalchemy import or_
+        except Exception as e:
+            logger.warning(f"订阅剧集自动清理：下载历史模块不可用：{e}")
+            return names, hashes, hash_eps
+        try:
+            with SessionFactory() as session:
+                q = session.query(DownloadHistory)
+                if tid:
+                    q = q.filter(or_(DownloadHistory.tmdbid == tid,
+                                     DownloadHistory.title == title))
+                elif title:
+                    q = q.filter(DownloadHistory.title == title)
+                else:
+                    return names, hashes, hash_eps
+                rows = q.all()
+                import re as _re
+                for r in rows or []:
+                    tn = (getattr(r, "torrent_name", "") or "").strip()
+                    if tn:
+                        # 去季集后缀，保留主名部分作别名
+                        base = _re.sub(r"[.\s_-]*S\d{1,2}(E\d{1,3})?.*$", "", tn, flags=_re.I)
+                        base = _re.sub(r"[.\s_-]*第?\d{0,3}[季部].*$", "", base)
+                        if len(norm_text(base)) >= 4:
+                            names.add(norm_text(base))
+                    h = (getattr(r, "download_hash", "") or "").strip().lower()
+                    if h:
+                        hashes.setdefault(h, set()).add(tn)
+                        heps = self._parse_hist_eps(getattr(r, "episodes", ""))
+                        if heps:
+                            merged = set(hash_eps.get(h) or [])
+                            merged.update(heps)
+                            hash_eps[h] = sorted(merged)
+        except Exception as e:
+            logger.warning(f"订阅剧集自动清理：挖掘订阅历史别名失败：{e}")
+        return names, hashes, hash_eps
+
     def _match_terms(self, sub: Dict[str, Any]) -> List[str]:
-        """用于匹配种子标题的归一化词：订阅名 / 订阅 keyword / 自定义匹配词"""
+        """用于匹配种子标题的归一化词：订阅名 / keyword / 历史发布名别名 / 自定义匹配词"""
         terms = []
         if sub:
             if sub.get("name"):
                 terms.append(norm_text(sub["name"]))
             if sub.get("keyword"):
                 terms.append(norm_text(sub["keyword"]))
+            # 自动融合下载历史里的发布名别名（英文发布名）
+            names, _, _ = self._load_sub_aliases(sub)
+            terms.extend(sorted(names))
         for kw in (self._match_keywords or "").splitlines():
             k = kw.strip()
             if k:
                 terms.append(norm_text(k))
         return [t for t in terms if t]
 
-    def _is_matched(self, torrent_name: str, terms: List[str], sub: Dict[str, Any]) -> bool:
+    def _is_matched(self, torrent_name: str, terms: List[str], sub: Dict[str, Any],
+                     torrent_hash: str = "", sub_hashes: Optional[Dict[str, set]] = None) -> bool:
+        # 1) hash 精确命中（最可靠）
+        if sub_hashes and torrent_hash:
+            h = (torrent_hash or "").split("@")[0].lower()
+            if h and h in sub_hashes:
+                return True
         if not terms:
             return False
         t = norm_text(torrent_name)
@@ -648,13 +729,19 @@ class SubscribeEpisodeCleaner(_PluginBase):
     def _analyze(self, sub: Dict[str, Any], items: Dict[str, dict]) -> Dict[str, Any]:
         """分析订阅剧集，返回应清理的种子与保留/剔除信息"""
         terms = self._match_terms(sub)
+        _, sub_hashes, hash_eps = self._load_sub_aliases(sub)
         matched = []
         for key, it in items.items():
-            if not self._is_matched(it.get("name", ""), terms, sub):
+            if not self._is_matched(it.get("name", ""), terms, sub,
+                                    torrent_hash=it.get("hash", ""), sub_hashes=sub_hashes):
                 continue
+            h = (it.get("hash", "") or "").split("@")[0].lower()
+            # 集号优先取下载历史按 hash 的记录（整季包种子名字无集号），名字解析兑底
+            hist_eps = hash_eps.get(h) or []
             seasons, eps = parse_episodes(it.get("name", ""))
             it["_seasons"] = seasons
-            it["_eps"] = eps
+            it["_eps"] = sorted(set(hist_eps) | set(eps))
+            it["_eps_from_hist"] = bool(hist_eps)
             it["key"] = key
             matched.append(it)
         downloaded_eps = sorted({int(e) for it in matched for e in (it.get("_eps") or [])})
