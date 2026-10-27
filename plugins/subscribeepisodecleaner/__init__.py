@@ -110,7 +110,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份恢复、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -821,7 +821,10 @@ class SubscribeEpisodeCleaner(_PluginBase):
         logger.info(f"订阅剧集自动清理：分析完成，共 {len(subs)} 个订阅，种子 {agg['total_torrents']}，"
                     f"待清理 {len(agg['candidates'])}（释放 {self._fmt_size(agg['free_size'])}）")
         if self._auto and agg.get("candidates"):
-            self._execute(agg["candidates"])
+            ok, kept, t_stats, o_stats = self._execute(agg["candidates"])
+            # 定时自动清理也发执行回执（v1.4）
+            if self._notify:
+                self._send_exec_notification(ok, kept, t_stats, o_stats, len(agg["candidates"]))
         elif self._notify and agg.get("candidates"):
             lines = []
             for r in (agg.get("subs") or []):
@@ -848,6 +851,21 @@ class SubscribeEpisodeCleaner(_PluginBase):
         agg = self._analyze_all(subs, items)
         self.save_data("result", agg)
         logger.info(f"订阅剧集自动清理：扫描完成，共 {len(subs)} 个订阅，待清理 {len(agg['candidates'])} 个种子")
+        # 扫描回执通知（v1.4：含各订阅保留/剔除窗口）
+        if self._notify:
+            lines = []
+            for r in (agg.get("subs") or []):
+                sub = r.get("sub") or {}
+                cands = len(r.get("candidates") or [])
+                kept_eps = r.get("keep_eps") or []
+                drop_eps = r.get("drop_eps") or []
+                lines.append(f"▶ 《{sub.get('name')}》第{sub.get('season')}季："
+                             f"保留 {self._eps_text(kept_eps) or '无'}，剔除 {len(drop_eps)} 集"
+                             + (f"，待清理 {cands} 个种子（{self._fmt_size(r.get('free_size', 0))}）" if cands else "，无待清理"))
+            text = (f"{self._notify_title_prefix}: 订阅剧集自动清理-扫描完成\n"
+                    f"共 {len(subs)} 个订阅，待清理 {len(agg.get('candidates') or [])} 个种子，"
+                    f"释放约 {self._fmt_size(agg.get('free_size', 0))}\n" + "\n".join(lines))
+            self._send_notification(text)
         return {"success": True, "subs": len(subs),
                 "candidates": len(agg["candidates"]),
                 "free_size": agg["free_size"]}
@@ -863,9 +881,37 @@ class SubscribeEpisodeCleaner(_PluginBase):
         candidates = saved.get("candidates") or []
         if not candidates:
             return {"success": False, "message": "无待清理结果，请先扫描分析"}
-        ok, kept, t_stats = self._execute(candidates)
+        ok, kept, t_stats, o_stats = self._execute(candidates)
+        # 执行回执通知（v1.4：每次执行后必发，含删除/释放/防重下汇总）
+        if self._notify:
+            self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates))
         return {"success": True, "ok": ok, "total": len(candidates),
-                "kept": len(kept), "transfer": t_stats}
+                "kept": len(kept), "transfer": t_stats, "orphan": o_stats}
+
+    def _send_exec_notification(self, ok: int, kept: List[str], t_stats: Dict[str, int],
+                                 o_stats: Dict[str, int], total: int):
+        """执行清理后发送回执通知（v1.4）"""
+        lines = [f"清理完成：删除种子任务 {ok} 个（含辅种级联）"]
+        if kept:
+            lines.append(f"因数据共享保留：{len(kept)} 个")
+        if t_stats:
+            lines.append(f"整理联动：转移记录 {t_stats.get('records', 0)} 条 / 媒体文件 {t_stats.get('files', 0)} 个"
+                         + (f" / 跳过 {t_stats.get('skipped', 0)} 个" if t_stats.get('skipped') else ""))
+        if o_stats:
+            lines.append(f"旧集媒体清理：视频及附属 {o_stats.get('files', 0)} 个 / 转移记录 {o_stats.get('records', 0)} 条")
+        saved = self.get_data("result") or {}
+        sub_lines = []
+        for r in (saved.get("subs") or []):
+            sub = r.get("sub") or {}
+            kept_eps = r.get("keep_eps") or []
+            if kept_eps:
+                sub_lines.append(f"▶ 《{sub.get('name')}》保留最新 {len(kept_eps)} 集（{self._eps_text(kept_eps)}）")
+        if sub_lines:
+            lines.append("各订阅保留窗口：")
+            lines.extend(f"  {l}" for l in sub_lines)
+        text = f"{self._notify_title_prefix}: 订阅剧集自动清理-执行回执\n" + "\n".join(lines)
+        text += "\n已删除集号已写入订阅 note，不会被订阅重新下载。"
+        self._send_notification(text)
 
     def _execute(self, candidates: List[Dict]) -> Tuple[int, List[str], Dict[str, int]]:
         """执行删除：按下载器分批删数据+退出做种，备份回收站，清理媒体库硬链接与转移记录；
@@ -969,7 +1015,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                         f"转移记录 {o_stats.get('records', 0)} 条")
         # 更新订阅 note：把这些剔除的集号标记为"已下载过"，防止重下
         self._mark_episodes_done()
-        return ok, kept, t_stats
+        return ok, kept, t_stats, o_stats
 
     def _mark_episodes_done(self):
         """把每个订阅本次剔除的集号写入各自订阅 note（JSON 列表），MP 将其视为已下载不再补下。"""
