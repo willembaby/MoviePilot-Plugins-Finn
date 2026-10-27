@@ -1,8 +1,11 @@
 import bisect
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
 from app.helper.downloader import DownloaderHelper
@@ -24,7 +27,7 @@ class OrphanFileCleaner(_PluginBase):
     3. 支持逐条或批量删除孤儿：默认移入回收站目录（可恢复），或彻底删除
 
     安全设计：
-    - 默认"移入回收站"模式，可配置为彻底删除
+    - 默认"移入回收站"模式，可配置为彻底删除；回收站文件可设保留天数自动过期清理（v1.7）
     - 删除仅针对扫描结果中的孤儿路径，不做任何推断删除
     - 支持下载器容器路径映射（如 /downloads=/media）
     - 删除前校验路径必须位于已配置的扫描目录范围内
@@ -36,7 +39,7 @@ class OrphanFileCleaner(_PluginBase):
                    "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
                    "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
@@ -49,11 +52,14 @@ class OrphanFileCleaner(_PluginBase):
     _paths = ""              # 下载器容器路径映射，如 /downloads=/media;旧=/新
     _delete_mode = "trash"   # trash=移入回收站 / delete=彻底删除
     _trash_dir = ""          # 回收站目录，留空则自动（扫描目录下 .orphan_trash）
+    _trash_retention_days = 30  # 回收站文件保留天数（按移入时间，超期自动清理，0=永不清理）（v1.7）
+    _trash_clean_cron = ""      # 回收站定时清理 Cron（留空=不定时，扫描/手动触发时顺带清理）（v1.7）
     _notify = True
     _notify_title_prefix = "HA通知"
     _hardlink_search = True      # 是否检查硬链接
     _hardlink_search_dirs = ""  # 硬链接额外搜索目录（每行一个），默认在扫描目录内搜索
     _sel: List[str] = []         # 勾选集合（内存缓存，避免每次点击写库产生闪烁延迟）
+    _scheduler = None            # 回收站定时清理调度器（v1.7）
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -62,6 +68,11 @@ class OrphanFileCleaner(_PluginBase):
             self._paths = str(config.get("paths") or "")
             self._delete_mode = str(config.get("delete_mode") or "trash")
             self._trash_dir = str(config.get("trash_dir") or "")
+            try:
+                self._trash_retention_days = max(int(config.get("trash_retention_days") or 30), 0)
+            except Exception:
+                self._trash_retention_days = 30
+            self._trash_clean_cron = str(config.get("trash_clean_cron") or "").strip()
             self._notify = bool(config.get("notify", True))
             self._notify_title_prefix = config.get("notify_title_prefix") or "HA通知"
             self._hardlink_search = bool(config.get("hardlink_search", True))
@@ -70,12 +81,38 @@ class OrphanFileCleaner(_PluginBase):
         logger.info(f"孤儿文件清理：配置加载完成，enabled={self._enabled}，"
                     f"扫描目录={self._scan_dirs.strip() or '(未配置)'}")
 
+        self.__stop_scheduler()
+        # 回收站定时清理（v1.7：cron 非空时启用，仅清理过期 trash 文件，不扫描不删孤儿）
+        if self._enabled and self._trash_clean_cron:
+            try:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._scheduler.add_job(
+                    func=self._schedule_trash_clean,
+                    trigger=CronTrigger.from_crontab(self._trash_clean_cron),
+                    name="孤儿文件清理-回收站定时清理",
+                )
+                self._scheduler.start()
+                logger.info(f"孤儿文件清理：回收站定时清理注册成功：cron={self._trash_clean_cron}，"
+                            f"保留 {self._trash_retention_days} 天")
+            except Exception as e:
+                logger.error(f"孤儿文件清理：回收站定时清理注册失败：{e}")
+
     def get_state(self) -> bool:
         return self._enabled
 
     def stop_service(self):
         """停止插件服务"""
-        pass
+        self.__stop_scheduler()
+
+    def __stop_scheduler(self):
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            print(str(e))
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -190,6 +227,40 @@ class OrphanFileCleaner(_PluginBase):
                             },
                         ]
                     },
+                    # Row 3.5: 回收站保留天数 / 定时清理（v1.7）
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'trash_retention_days',
+                                            'label': '回收站文件保留天数（按移入时间，超期自动清理，0=永不清理）',
+                                            'placeholder': '30'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'trash_clean_cron',
+                                            'label': '回收站定时清理(Cron)（留空=不定时，扫描时顺带清理）',
+                                            'placeholder': '0 4 * * *（每天凌晨4点）'
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
                     # Row 4: 硬链接检查
                     {
                         'component': 'VRow',
@@ -250,6 +321,8 @@ class OrphanFileCleaner(_PluginBase):
             "paths": "",
             "delete_mode": "trash",
             "trash_dir": "",
+            "trash_retention_days": 30,
+            "trash_clean_cron": "",
             "notify": True,
             "notify_title_prefix": "HA通知",
             "hardlink_search": True,
@@ -545,6 +618,12 @@ class OrphanFileCleaner(_PluginBase):
                 "methods": ["GET"],
                 "summary": "清空扫描结果"
             },
+            {
+                "path": "/clean_trash",
+                "endpoint": self.clean_trash_api,
+                "methods": ["GET"],
+                "summary": "清理回收站过期文件（按保留天数）"
+            },
         ]
 
     # ==================== 核心逻辑 ====================
@@ -726,6 +805,7 @@ class OrphanFileCleaner(_PluginBase):
         dirs = [d.strip() for d in (self._scan_dirs or "").splitlines() if d.strip()]
         if not dirs:
             return {"success": False, "message": "未配置扫描目录"}
+        trash_stats = self._clean_trash()  # v1.7：扫描前先清理回收站过期文件
         logger.info("孤儿文件清理：开始扫描，收集下载器种子引用集合...")
         cr = sorted(self._collect_roots())
         logger.info(f"孤儿文件清理：引用集合 {len(cr)} 个，开始遍历目录...")
@@ -753,8 +833,12 @@ class OrphanFileCleaner(_PluginBase):
             self.save_data("result", {"time": result["time"], "items": items, "total": len(items)})
         logger.info(f"孤儿文件清理：扫描完成，共 {len(items)} 个孤儿文件" + (f"，其中 {hl_count} 个有硬链接" if self._hardlink_search else ""))
         if self._notify:
-            self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-扫描完成\n"
-                              f"发现 {len(items)} 个孤儿文件，请到插件页面查看/删除")
+            text = (f"{self._notify_title_prefix}: 孤儿文件清理-扫描完成\n"
+                    f"发现 {len(items)} 个孤儿文件，请到插件页面查看/删除")
+            t_line = self._trash_line(trash_stats)
+            if t_line:
+                text += "\n" + t_line
+            self._send_notify(text)
         return {"success": True, "total": len(items), "items": items}
 
     def delete_api(self, path: str) -> Dict[str, Any]:
@@ -948,6 +1032,11 @@ class OrphanFileCleaner(_PluginBase):
                     target = f"{base}_{n}{ext}"
                     n += 1
                 os.rename(path, target)
+                # v1.7：更新 mtime 为移入时间（rename 不改 mtime，作为回收站过期清理的计时基准）
+                try:
+                    os.utime(target, None)
+                except Exception:
+                    pass
                 logger.info(f"孤儿文件清理：已移入回收站：{path} -> {target}")
                 return True, f"已移入回收站 {target}"
             else:
@@ -965,6 +1054,121 @@ class OrphanFileCleaner(_PluginBase):
         deleted = self.get_data("deleted") or []
         deleted.append(f"{datetime.now().strftime('%m-%d %H:%M')} {msg}")
         self.save_data("deleted", deleted[-200:])
+
+    # ==================== 回收站过期自动清理（v1.7） ====================
+
+    def _trash_dirs(self) -> List[str]:
+        """收集全部可能存在孤儿备份的回收站目录（配置目录+各扫描目录自动目录+/tmp 兑底）"""
+        dirs, seen = [], set()
+        if self._trash_dir.strip():
+            d = self._trash_dir.strip()
+            dirs.append(d)
+            seen.add(d)
+        for d in [x.strip() for x in (self._scan_dirs or "").splitlines() if x.strip()]:
+            t = os.path.join(d, ".orphan_trash")
+            if t not in seen:
+                dirs.append(t)
+                seen.add(t)
+        if "/tmp/orphan_trash" not in seen:
+            dirs.append("/tmp/orphan_trash")
+        return [d for d in dirs if os.path.isdir(d)]
+
+    def _clean_trash(self) -> Optional[Dict[str, int]]:
+        """回收站过期文件自动清理（v1.7）：移入时间超过保留天数的文件/目录彻底删除。
+        计时基准 = 文件 mtime（移入时已 touch 为移入时间）；首次运行时给存量文件
+        统一打基准时间重新计时，避免升级前已移入的文件被立即清除。
+        保留天数 <=0 或非回收站模式时跳过。
+        返回 {"removed": 清理项数, "freed_bytes": 释放空间}，未启用返回 None"""
+        if self._delete_mode != "trash" or self._trash_retention_days <= 0:
+            return None
+        first_run = not self.get_data("trash_baseline")
+        if first_run:
+            # 首次运行：全部存量打基准（从现在起重新计时），不删除任何文件
+            marked = 0
+            for d in self._trash_dirs():
+                try:
+                    for fn in os.listdir(d):
+                        fp = os.path.join(d, fn)
+                        try:
+                            os.utime(fp, None)
+                            marked += 1
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+            self.save_data("trash_baseline", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            if marked:
+                logger.info(f"孤儿文件清理：回收站过期清理初始化：{marked} 个存量条目已重置计时"
+                            f"（保留 {self._trash_retention_days} 天后开始清理）")
+            return {"removed": 0, "freed_bytes": 0, "marked": marked, "first_run": True}
+        cutoff_ts = (datetime.now() - timedelta(days=self._trash_retention_days)).timestamp()
+        removed, freed = 0, 0
+        for d in self._trash_dirs():
+            try:
+                for fn in os.listdir(d):
+                    fp = os.path.join(d, fn)
+                    try:
+                        if os.path.getmtime(fp) >= cutoff_ts:
+                            continue
+                        if os.path.isdir(fp) and not os.path.islink(fp):
+                            for root, _, files in os.walk(fp):
+                                for f in files:
+                                    try:
+                                        freed += os.path.getsize(os.path.join(root, f))
+                                    except Exception:
+                                        pass
+                            shutil.rmtree(fp)
+                        else:
+                            try:
+                                freed += os.path.getsize(fp)
+                            except Exception:
+                                pass
+                            os.remove(fp)
+                        removed += 1
+                    except Exception as e:
+                        logger.warning(f"孤儿文件清理：回收站过期清理单项失败（{fn}）：{e}")
+            except Exception:
+                continue
+        if removed:
+            logger.info(f"孤儿文件清理：回收站过期清理完成：删除 {removed} 项，"
+                        f"释放 {self._fmt_size(freed)}，保留 {self._trash_retention_days} 天")
+        return {"removed": removed, "freed_bytes": freed}
+
+    def _trash_line(self, trash_stats: Optional[Dict[str, int]]) -> str:
+        """通知用回收站维护摘要行（无清理时不显示）"""
+        if trash_stats and trash_stats.get("removed"):
+            return (f"回收站维护：清理过期文件 {trash_stats['removed']} 项"
+                    f"（释放 {self._fmt_size(trash_stats.get('freed_bytes', 0))}，"
+                    f"保留 {self._trash_retention_days} 天）")
+        return ""
+
+    def clean_trash_api(self) -> Dict[str, Any]:
+        """手动触发回收站过期清理（API）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        stats = self._clean_trash()
+        if stats is None:
+            return {"success": False, "message": "非回收站模式或保留天数为 0（永不清理）"}
+        if stats.get("first_run"):
+            return {"success": True, "first_run": True, "marked": stats.get("marked", 0),
+                    "retention_days": self._trash_retention_days,
+                    "message": (f"首次初始化：{stats.get('marked', 0)} 个存量条目已重置计时，"
+                                f"{self._trash_retention_days} 天后开始自动清理")}
+        return {"success": True, "removed": stats.get("removed", 0),
+                "freed_bytes": stats.get("freed_bytes", 0),
+                "retention_days": self._trash_retention_days,
+                "freed": self._fmt_size(stats.get("freed_bytes", 0)),
+                "message": (f"已清理过期文件 {stats.get('removed', 0)} 项，"
+                            f"释放 {self._fmt_size(stats.get('freed_bytes', 0))}"
+                            if stats.get("removed") else "无过期文件")}
+
+    def _schedule_trash_clean(self):
+        """定时清理入口（仅清过期 trash 文件，不扫描不删孤儿）"""
+        stats = self._clean_trash()
+        if stats is None:
+            return
+        if self._notify and stats.get("removed"):
+            self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-回收站定时维护\n" + self._trash_line(stats))
 
     @staticmethod
     def _fmt_size(size) -> str:
