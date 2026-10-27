@@ -39,7 +39,7 @@ class OrphanFileCleaner(_PluginBase):
                    "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
                    "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.7"
+    plugin_version = "1.7.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
@@ -676,14 +676,18 @@ class OrphanFileCleaner(_PluginBase):
         return p
 
     def _scan_dir(self, path: str, cr: List[str], base: str, items: List[Dict]):
-        """递归扫描目录，cr 为已排序引用集合，孤儿条目加入 items"""
+        """递归扫描目录，cr 为已排序引用集合，孤儿条目加入 items
+        v1.7.1：跳过回收站目录自身（防止 .orphan_trash 被当成孤儿再移入嵌套、计时重置）"""
         try:
             with os.scandir(path) as it:
                 entries = list(it)
         except Exception:
             return
+        trash_set = self._trash_targets()
         for e in entries:
             p = e.path
+            if e.is_dir(follow_symlinks=False) and os.path.abspath(p) in trash_set:
+                continue
             i = bisect.bisect_left(cr, p)
             contained = i < len(cr) and (cr[i] == p or cr[i].startswith(p + "/"))
             referenced = i > 0 and (p == cr[i - 1] or p.startswith(cr[i - 1] + "/"))
@@ -1016,6 +1020,25 @@ class OrphanFileCleaner(_PluginBase):
             if path == d or path.startswith(d.rstrip("/") + "/"):
                 return os.path.join(d, ".orphan_trash")
         return "/tmp/orphan_trash"
+
+    def _trash_targets(self) -> set:
+        """全部回收站目录的绝对路径集合（v1.7.1：扫描时跳过，防止回收站自身被当孤儿）"""
+        dirs = set()
+        if self._trash_dir.strip():
+            try:
+                dirs.add(os.path.abspath(self._trash_dir.strip()))
+            except Exception:
+                pass
+        for d in [x.strip() for x in (self._scan_dirs or "").splitlines() if x.strip()]:
+            try:
+                dirs.add(os.path.abspath(os.path.join(d, ".orphan_trash")))
+            except Exception:
+                pass
+        try:
+            dirs.add(os.path.abspath("/tmp/orphan_trash"))
+        except Exception:
+            pass
+        return dirs
 
     def _delete_path(self, path: str) -> Tuple[bool, str]:
         """按配置模式删除路径，返回 (是否成功, 说明)"""
