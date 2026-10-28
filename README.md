@@ -36,7 +36,7 @@
 
 **依赖**：MoviePilot v2（使用内置 TmdbChain / SubscribeChain）。
 
-### 3. 种子文件清理（TorrentFileCleaner）v1.3
+### 3. 种子文件清理（TorrentFileCleaner）v1.3.1
 
 **解决痛点**：手工清理或迁移媒体文件后，下载器中残留“数据文件已被删除”的空壳种子任务，占用下载器资源、影响做种统计。
 
