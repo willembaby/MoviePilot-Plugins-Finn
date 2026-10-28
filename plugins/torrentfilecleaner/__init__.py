@@ -47,7 +47,7 @@ class TorrentFileCleaner(_PluginBase):
                    "并自动清理（仅删任务不删文件）。每个下载器可独立开关与配置容器路径映射，"
                    "支持全量不可达保护，飞书通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.3"
+    plugin_version = "1.3.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "torrentfilecleaner_"
@@ -523,8 +523,9 @@ class TorrentFileCleaner(_PluginBase):
 
             missing += 1
             logger.info(f"种子文件清理：[{name}] 检测到无数据文件种子 "
-                        f"- 《{torrent_name}》(path={full_path}, id={t.id})")
-            remove_ids.append(str(t.id))
+                        f"- 《{torrent_name}》(path={full_path}, hash={str(self.__tr_hash(t))[:12]})")
+            # v1.3.1：TR 删除须用 sha1 hash（hash_string/hashString），数字 id 会被 RPC 拒收
+            remove_ids.append(self.__tr_hash(t))
             removed_detail.append(f"《{torrent_name}》 [{name}/TR 目录: {download_dir}]")
 
         # 全量不可达保护：全部（>=3）路径不存在 = 疑似挂载问题而非数据丢失
@@ -542,6 +543,12 @@ class TorrentFileCleaner(_PluginBase):
             else:
                 logger.error(f"种子文件清理：从 {name}(TR) 删除种子任务失败")
         return 0, [], None, len(torrents)
+
+    @staticmethod
+    def __tr_hash(t) -> str:
+        """v1.3.1：取 TR 种子的 sha1 hash（兼容新老字段名 hash_string / hashString），无则回退数字 id"""
+        h = getattr(t, "hash_string", None) or getattr(t, "hashString", None)
+        return str(h or getattr(t, "id", ""))
 
     def __clean_qbittorrent(self, name: str, inst,
                             maps: List[Tuple[str, str]]) -> Tuple[int, List[str], Optional[str]]:
