@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -48,7 +49,7 @@ class TorrentFileCleaner(_PluginBase):
                    "并自动清理（仅删任务不删文件）。每个下载器可独立开关与配置容器路径映射，"
                    "支持全量不可达保护，飞书通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "torrentfilecleaner_"
@@ -67,6 +68,7 @@ class TorrentFileCleaner(_PluginBase):
     _auto_delete = False                # 定时扫描后自动删除（默认 False：只展示到页面，人工确认删）（v1.4）
     _scheduler = None
     _sel: List[str] = []                # 当前勾选的条目 id（内存，避免每次点击写库闪烁）（v1.4）
+    _site_map_cache: Optional[Dict[str, str]] = None  # 站点域名→站点名缓存（v1.4.1）
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -415,6 +417,17 @@ class TorrentFileCleaner(_PluginBase):
                 dl_type = g_items[0].get("dl_type", "?") if g_items else "?"
                 sel_in_group = sum(1 for it in g_items if it.get("id") in selected_set)
                 all_selected = sel_in_group == len(g_items)
+                # v1.4.1：组头增加站点分布与总大小
+                site_dist = {}
+                for it in g_items:
+                    sn = str(it.get("site") or "未知")
+                    site_dist[sn] = site_dist.get(sn, 0) + 1
+                dist_text = " / ".join(f"{k}:{v}" for k, v in
+                                        sorted(site_dist.items(), key=lambda x: -x[1])[:6])
+                g_size = sum(int(it.get("size") or 0) for it in g_items)
+                stat_text = f"{len(g_items)} 项 · {self._fmt_size(g_size)} · 已勾选 {sel_in_group}"
+                if dist_text:
+                    stat_text += f" · {dist_text}"
                 page.append({
                     'component': 'VRow',
                     'props': {'class': 'ma-0 mt-3 mb-1 py-2 px-2 d-flex align-center',
@@ -426,12 +439,12 @@ class TorrentFileCleaner(_PluginBase):
                                       'events': {'click': {'api': 'plugin/TorrentFileCleaner/toggle_dl',
                                                           'method': 'get',
                                                           'params': {'dl': dl, 'apikey': settings.API_TOKEN}}}}]},
-                        {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
-                         'content': [
-                             {'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold text-primary'},
-                              'text': f"⬇ {dl}（{dl_type}）"},
-                             {'component': 'div', 'props': {'class': 'text-caption text-grey'},
-                              'text': f"{len(g_items)} 项 · 已勾选 {sel_in_group}"}]},
+                             {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
+                              'content': [
+                                  {'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold text-primary'},
+                                   'text': f"⬇ {dl}（{dl_type}）"},
+                                  {'component': 'div', 'props': {'class': 'text-caption text-grey'},
+                                   'text': stat_text}]},
                         {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                          'content': [self._btn("删除本组全部", 'plugin/TorrentFileCleaner/delete_all',
                                                {'dl': dl, 'confirm': 'yes'}, 'error', 'tonal')]},
@@ -443,8 +456,6 @@ class TorrentFileCleaner(_PluginBase):
                     row_style = 'background: rgba(76,175,80,0.12); border-radius: 6px;' if checked else ''
                     h = str(it.get("hash", ""))
                     sub = it.get("path", "") or "—"
-                    if it.get("size"):
-                        sub += f" · {self._fmt_size(it.get('size'))}"
                     if h:
                         sub += f" · hash {h[:12]}"
                     page.append({
@@ -456,16 +467,27 @@ class TorrentFileCleaner(_PluginBase):
                                           'events': {'click': {'api': 'plugin/TorrentFileCleaner/toggle',
                                                               'method': 'get',
                                                               'params': {'id': idx, 'apikey': settings.API_TOKEN}}}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 7},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 5},
                              'content': [
                                  {'component': 'div', 'props': {'class': 'text-body-2'},
                                   'text': it.get("name", "")},
                                  {'component': 'div', 'props': {'class': 'text-caption text-grey text-truncate'},
-                                  'props_style': '', 'text': sub}]},
+                                  'text': sub}]},
+                            # v1.4.1：站点名列
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 2},
                              'content': [
-                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': "保存目录"},
-                                 {'component': 'div', 'props': {'class': 'text-caption text-grey-darken-1 text-truncate'},
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 'text': "站点"},
+                                 {'component': 'div',
+                                  'props': {'class': 'text-caption text-primary font-weight-medium text-truncate'},
+                                  'text': str(it.get("site") or "未知")}]},
+                            # v1.4.1：大小/保存目录列
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 2},
+                             'content': [
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey'}, 
+                                  'text': "大小 / 目录"},
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey-darken-1'},
+                                  'text': self._fmt_size(it.get('size'))},
+                                 {'component': 'div', 'props': {'class': 'text-caption text-grey text-truncate'},
                                   'text': it.get("save_dir", "") or "—"}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 2},
                              'content': [self._btn("删除", 'plugin/TorrentFileCleaner/delete',
@@ -738,15 +760,23 @@ class TorrentFileCleaner(_PluginBase):
                 continue
             missing += 1
             h = self.__tr_hash(t)
+            # v1.4.1：站点名（TR 种子对象自带 trackers）+ 大小多字段兼容
             try:
-                size = int(getattr(t, "size", 0) or 0)
+                tks = getattr(t, "trackers", None) or []
+                turls = [str(getattr(tk, "announce", "") or "") for tk in tks]
+            except Exception:
+                turls = []
+            site = self._site_of_trackers(turls)
+            try:
+                size = int(getattr(t, "total_size", 0) or getattr(t, "size_when_done", 0)
+                           or getattr(t, "size", 0) or 0)
             except Exception:
                 size = 0
             logger.info(f"种子文件清理：[{name}] 检测到无数据文件种子 "
                         f"- 《{torrent_name}》(path={full_path}, hash={h[:12]})")
             items.append({"id": f"{name}|{h}", "downloader": name, "dl_type": "TR",
                           "name": torrent_name, "path": full_path, "hash": h,
-                          "size": size, "save_dir": download_dir})
+                          "size": size, "save_dir": download_dir, "site": site})
         # 全量不可达保护：全部（>=3）路径不存在 = 疑似挂载问题而非数据丢失
         if missing >= 3 and missing == len(torrents):
             logger.warning(f"种子文件清理：{name}(TR) 全部 {missing} 个种子路径均不可达，"
@@ -760,6 +790,45 @@ class TorrentFileCleaner(_PluginBase):
         """v1.3.1：取 TR 种子的 sha1 hash（兼容新老字段名 hash_string / hashString），无则回退数字 id"""
         h = getattr(t, "hash_string", None) or getattr(t, "hashString", None)
         return str(h or getattr(t, "id", ""))
+
+    def _site_name_map(self) -> Dict[str, str]:
+        """站点主域名 -> 站点名（MoviePilot 站点管理，实例级缓存）（v1.4.1）"""
+        if self._site_map_cache is not None:
+            return self._site_map_cache
+        m = {}
+        try:
+            from app.db.site_oper import SiteOper
+            for site in (SiteOper().list() or []):
+                name = str(getattr(site, "name", "") or "").strip()
+                domain = str(getattr(site, "domain", "") or "").strip().lower()
+                if name and domain:
+                    m[domain] = name
+        except Exception as e:
+            logger.warning(f"种子文件清理：读取站点列表失败：{e}")
+        self._site_map_cache = m
+        return m
+
+    def _site_of_trackers(self, urls) -> str:
+        """从 tracker URL 列表解析站点名（v1.4.1）：过滤 DHT/PeX/LSD 伪 tracker，
+        域名精确/后缀双向匹配站点表；匹配不到退回首个真实 tracker 域名，再无则“未知”"""
+        host = ""
+        sm = self._site_name_map()
+        for u in urls or []:
+            u = str(u or "").strip()
+            if not u or u.startswith("**"):  # qB 伪 tracker：** [DHT] ** / ** [PeX] ** / ** [LSD] **
+                continue
+            try:
+                h = (urlparse(u).hostname or "").lower()
+            except Exception:
+                h = ""
+            if not h:
+                continue
+            if not host:
+                host = h
+            for domain, name in sm.items():
+                if h == domain or h.endswith("." + domain) or domain.endswith("." + h):
+                    return name
+        return host or "未知"
 
     def __scan_qbittorrent(self, name: str, inst, maps: List[Tuple[str, str]]):
         """收集 qB 中数据文件不存在的种子（v1.4：只收集不删）。
@@ -795,15 +864,21 @@ class TorrentFileCleaner(_PluginBase):
             if any(os.path.exists(p) for p in all_candidates):
                 continue
             missing += 1
+            # v1.4.1：站点名（qB 需按候选逐个取 trackers，仅对候选调用不影响性能）+ 大小多字段兼容
             try:
-                size = int(d.get("size") or 0)
+                turls = inst.get_trackers(torrent_hash) or []
+            except Exception:
+                turls = []
+            site = self._site_of_trackers(turls)
+            try:
+                size = int(d.get("size") or d.get("total_size") or 0)
             except Exception:
                 size = 0
             logger.info(f"种子文件清理：[{name}] 检测到无数据文件种子 "
                         f"- 《{torrent_name}》(path={candidates[0] if candidates else '?'}, hash={torrent_hash[:12]})")
             items.append({"id": f"{name}|{torrent_hash}", "downloader": name, "dl_type": "qB",
                           "name": torrent_name, "path": candidates[0] if candidates else "",
-                          "hash": torrent_hash, "size": size, "save_dir": save_path})
+                          "hash": torrent_hash, "size": size, "save_dir": save_path, "site": site})
         # 全量不可达保护
         if missing >= 3 and missing == len(torrents):
             logger.warning(f"种子文件清理：{name}(qB) 全部 {missing} 个种子路径均不可达，"
