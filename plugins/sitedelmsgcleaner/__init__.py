@@ -27,7 +27,7 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.message import Notification
 from app.schemas.types import EventType, NotificationType
-from app.utils.event import EventManager
+from app.core.event import EventManager
 
 eventmanager = EventManager()
 
