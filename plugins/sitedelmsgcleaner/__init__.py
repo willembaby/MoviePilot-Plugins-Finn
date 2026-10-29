@@ -6,14 +6,16 @@
 （EventType.NoticeMessage 广播，mtype=SiteMessage），一旦发现「种子被删除」类站内信，
 自动删除对应的下载器种子、数据源文件与转移记录（transferhistory），并保留回收站审计记录。
 
+双触发通道：
+- 实时事件：订阅 EventType.NoticeMessage，收到即处理。
+- 兜底扫描：手动/「立即运行一次」时读 message 表最近站点消息，处理插件启用前漏掉的删种消息（按持久化去重，防重复）。
+
 安全约束：
 - 只有能明确提取出种子名、且能在下载器命中同名记录时才删除；无法提取或未命中则跳过。
-- 数据文件共享保护：候选数据路径若仍被删除范围外的其它种子引用，则降级为仅删任务、不删数据。
-- 回收站审计记录（name/hash/site/delete_time）按保留天数滚动清理（0=永久保留）。
-- 已处理消息按 source/title+text 去重，防重复触发。
+- 数据文件共享保护：候选数据路径若仍被范围外其它种子引用，降级为仅删任务、不删数据。
+- 回收站审计记录按保留天数滚动清理（0=永久）。
 """
 
-import logging
 import re
 from datetime import datetime, timedelta
 
@@ -21,6 +23,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
+from app.db.message_oper import MessageOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -70,9 +73,9 @@ _re_site = re.compile(r"(?:【)?站点\s*([^\s】。]+)")
 
 class SiteDelMsgCleaner(_PluginBase):
     plugin_name = "站点删种消息自动清理"
-    plugin_desc = "检测站点删除种子类站内信，自动删除对应种子、数据源文件与转移记录"
-    plugin_icon = "https://raw.githubusercontent.com/willembaby/MoviePilot-Plugins-Finn/main/icon.png"
-    plugin_version = "1.0.0"
+    plugin_desc = "检测站点删除种子类站内信，自动删除对应下载器种子、数据源文件与转移记录"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
+    plugin_version = "1.1.0"
     plugin_author = "Finn"
     author_url = ""
     plugin_config_prefix = "sitedelmsgcleaner_"
@@ -87,6 +90,7 @@ class SiteDelMsgCleaner(_PluginBase):
         self._delete_transfer = True
         self._match_keywords = ""
         self._retention_days = 30
+        self._scan_count = 200
         self._onlyonce = False
         self._scheduler = None
         self._processed = set()
@@ -101,7 +105,12 @@ class SiteDelMsgCleaner(_PluginBase):
             self._retention_days = int((config or {}).get("retention_days", 30))
         except (TypeError, ValueError):
             self._retention_days = 30
+        try:
+            self._scan_count = int((config or {}).get("scan_count", 200))
+        except (TypeError, ValueError):
+            self._scan_count = 200
         self._onlyonce = bool((config or {}).get("onlyonce", False))
+        self._load_processed()
 
         if not self._enabled:
             return
@@ -115,72 +124,114 @@ class SiteDelMsgCleaner(_PluginBase):
         self._scheduler.add_job(self._maintain_recycle, CronTrigger.from_crontab("0 3 * * *"),
                                 id="sitedelmsgcleaner_recycle", max_instances=1, coalesce=True)
         if self._onlyonce:
-            self._scheduler.add_job(self._maintain_recycle, "date",
-                                    run_date=datetime.now() + timedelta(seconds=1),
+            # 立即运行一次 = 兜底扫描 + 回收站维护
+            self._scheduler.add_job(self._run_once, "date",
+                                    run_date=datetime.now() + timedelta(seconds=2),
                                     id="sitedelmsgcleaner_once")
-            self.update_config({"onlyonce": False})
+            # 合并更新，不冲掉其它配置
+            cfg = self.get_config() or {}
+            cfg["onlyonce"] = False
+            self.update_config(cfg)
         self._scheduler.start()
 
     def get_state(self) -> bool:
         return self._enabled
 
-    # ------------------------------------------------------------------
-    # 事件入口（接住内置站点消息推送）
-    # ------------------------------------------------------------------
+    # ---------------- 事件入口 ----------------
     @eventmanager.register(EventType.NoticeMessage)
     def on_notice(self, event) -> None:
         if not self.get_state():
             return
         try:
-            self._on_notice(event)
+            self._on_event_data(event.event_data or {})
         except Exception as e:
             logger.error(f"{self.plugin_name} 处理通知事件出错：{e}")
 
-    def _on_notice(self, event) -> None:
-        data = event.event_data or {}
+    def _on_event_data(self, data):
         if not isinstance(data, dict) or not data:
             return
-        if data.get("channel"):            # 带渠道的外发消息不回
+        if data.get("channel"):
             return
         msg_type = data.get("type") or data.get("mtype")
         if msg_type != NotificationType.SiteMessage:
             return
         title = str(data.get("title") or "")
         text = str(data.get("text") or "")
-        msg_id = str(data.get("source") or data.get("message_id") or "")
-        dedup_key = msg_id or f"{title}|{text[:200]}"
+        dedup_key = str(data.get("source") or data.get("message_id") or "")
+        if not dedup_key:
+            dedup_key = f"evt:{title}|{text[:120]}"
         if dedup_key in self._processed:
             return
-        self._processed.add(dedup_key)
-        # 关键词过滤
-        keywords = [k.strip() for k in self._match_keywords.split(",") if k.strip()]
-        if not keywords:
-            logger.info(f"{self.plugin_name} 未配置触发关键词，跳过：{title}")
-            return
+        self._mark_processed(dedup_key)
+        self._handle_body(title, text, link=data.get("link") or "")
+
+    def _handle_body(self, title, text, link=""):
         body = f"{title}\n{text}"
         body_low = body.lower()
-        if not any(k.lower() in body_low for k in keywords):
+        keywords = [k.strip() for k in self._match_keywords.split(",") if k.strip()]
+        if not keywords or not any(k.lower() in body_low for k in keywords):
             return
         names = self._extract_names(body)
         if not names:
-            logger.info(f"{self.plugin_name} 命中关键词但无法提取种子名，跳过：{text[:80]}")
+            logger.info(f"{self.plugin_name} 命中关键词但无法提取种子名，跳过")
             return
         site_name = self._site_from_title(title)
         if self._auto_delete:
-            self._execute_delete(names, site_name=site_name, source=dedup_key)
+            self._execute_delete(names, site_name=site_name)
         else:
             self.post_message(Notification(
                 mtype=NotificationType.Plugin,
-                title=f"【{self.plugin_name}】检测到站点删种消息",
-                text=f"站点：{site_name or '未知'}\n种子：\n" + "\n".join(names) +
-                     "\n（当前为「仅记录」模式，未执行删除）",
-                link=data.get("link") or "",
+                title=f"【{self.plugin_name}】检测到站点删种消息（仅记录）",
+                text=f"站点：{site_name or '未知'}\n种子：\n" + "\n".join(names),
+                link=link,
             ))
 
+    # ---------------- 兜底扫描：读 message 表 ----------------
+    def _run_once(self):
+        self._scan_recent_messages()
+        self._clean_recycle()
+
+    def _scan_recent_messages(self):
+        """读 message 表最近站点消息，处理插件未覆盖的删种消息（持久化去重）"""
+        try:
+            msgs = MessageOper().list_by_page(page=1, count=max(self._scan_count, 20)) or []
+        except Exception as e:
+            logger.error(f"{self.plugin_name} 读取消息历史失败：{e}")
+            return {"total": 0, "handled": 0, "error": str(e)}
+        total = 0
+        for m in msgs:
+            mtype = getattr(m, "mtype", None)
+            if mtype != NotificationType.SiteMessage:
+                continue
+            title = str(getattr(m, "title", "") or "")
+            text = str(getattr(m, "text", "") or "")
+            dedup_key = f"msg:{getattr(m, 'id', '')}"
+            if dedup_key in self._processed:
+                continue
+            self._mark_processed(dedup_key)
+            total += 1
+            self._handle_body(title, text, link=getattr(m, "link", "") or "")
+        if total:
+            logger.info(f"{self.plugin_name} 扫描消息历史：处理 {total} 条未读站点消息")
+        return {"total": total, "handled": total}
+
+    # ---------------- 去重持久化 ----------------
+    def _load_processed(self):
+        self._processed = set(self.get_data("processed") or [])
+
+    def _mark_processed(self, key):
+        if key in self._processed:
+            return
+        self._processed.add(key)
+        data = list(self._processed)
+        if len(data) > 5000:
+            data = data[-5000:]
+        self.save_data("processed", data)
+
+    # ---------------- 解析 ----------------
     @staticmethod
     def _extract_names(body: str) -> list:
         names, seen = [], set()
-        # 优先引号内完整名
         for m in _re_quote_name.finditer(body):
             cand = m.group(1).strip()
             if len(cand) >= 8 and _norm(cand):
@@ -203,16 +254,13 @@ class SiteDelMsgCleaner(_PluginBase):
         m = _re_site.search(title or "")
         return m.group(1) if m else ""
 
-    # ------------------------------------------------------------------
-    # 删除执行
-    # ------------------------------------------------------------------
-    def _execute_delete(self, names, site_name="", source=""):
+    # ---------------- 删除执行 ----------------
+    def _execute_delete(self, names, site_name=""):
         services = DownloaderHelper().get_services()
         if not services:
             logger.warning(f"{self.plugin_name} 无可用下载器，跳过删除")
             return
-
-        all_torrents = []  # (svc_name, torrent)
+        all_torrents = []
         for svc_name, svc in services.items():
             inst = getattr(svc, "instance", None)
             if not inst:
@@ -220,7 +268,7 @@ class SiteDelMsgCleaner(_PluginBase):
             try:
                 torrents, err = inst.get_torrents()
             except Exception as e:
-                logger.error(f"{self.plugin_name} 获取下载器 {svc_name} 种子出错：{e}")
+                logger.error(f"{self.plugin_name} 获取 {svc_name} 种子出错：{e}")
                 continue
             if err or not torrents:
                 continue
@@ -236,9 +284,7 @@ class SiteDelMsgCleaner(_PluginBase):
             logger.info(f"{self.plugin_name} 未在下载器中命中种子：{names}")
             return
 
-        # 数据共享保护：候选数据路径是否被范围外种子引用
-        cand_paths = {_field_path(t) for _, t in candidates}
-        cand_paths = {p for p in cand_paths if p}
+        cand_paths = {p for p in (_field_path(t) for _, t in candidates) if p}
         protected = set()
         for svc_name, t in all_torrents:
             if t in [ct for _, ct in candidates]:
@@ -258,15 +304,9 @@ class SiteDelMsgCleaner(_PluginBase):
             thash = _field_hash(t)
             path = _field_path(t)
             del_data = bool(self._delete_data) and not (path in protected)
-            rec = {
-                "deleted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "site": site_name or "",
-                "name": tname or "",
-                "hash": thash or "",
-                "downloader": svc_name or "",
-                "delete_data": del_data,
-                "source": "",
-            }
+            rec = {"deleted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                   "site": site_name or "", "name": tname or "", "hash": thash or "",
+                   "downloader": svc_name or "", "delete_data": del_data}
             recycle_records.append(rec)
             inst = getattr(services.get(svc_name), "instance", None)
             if not inst:
@@ -288,8 +328,7 @@ class SiteDelMsgCleaner(_PluginBase):
                 stats["task_only"] += 1
             if self._delete_transfer and thash:
                 try:
-                    hist_list = TransferHistoryOper().list_by_hash(thash)
-                    for hist in hist_list:
+                    for hist in TransferHistoryOper().list_by_hash(thash):
                         TransferHistoryOper().delete(hist.id)
                         stats["transfer"] += 1
                 except Exception as e:
@@ -302,7 +341,6 @@ class SiteDelMsgCleaner(_PluginBase):
         self._clean_recycle()
         self._post_result(stats, site_name, len(protected))
 
-    # ---- 名称匹配 ----
     @staticmethod
     def _name_match(msg_name, tor_name) -> bool:
         mn, tn = _norm(msg_name), _norm(tor_name)
@@ -358,9 +396,7 @@ class SiteDelMsgCleaner(_PluginBase):
             text="\n".join(lines),
         ))
 
-    # ------------------------------------------------------------------
-    # 页面 / API
-    # ------------------------------------------------------------------
+    # ---------------- 页面 / API ----------------
     def get_form(self):
         return [
             {'component': 'VForm', 'content': [
@@ -369,9 +405,9 @@ class SiteDelMsgCleaner(_PluginBase):
                      'content': [{'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}]},
                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                      'content': [{'component': 'VSwitch', 'props': {'model': 'auto_delete', 'label': '自动删除',
-                                                                     'hint': '检测到删种消息立即执行；关闭则仅记录/通知'}}]},
+                                                                     'hint': '检测到删种消息立即执行；关闭则仅记录'}}]},
                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次维护'}}]},
+                     'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次（兜底扫描）'}}]},
                 ]},
                 {'component': 'VRow', 'content': [
                     {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
@@ -384,19 +420,19 @@ class SiteDelMsgCleaner(_PluginBase):
                     {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                      'content': [{'component': 'VTextField', 'props': {'model': 'match_keywords', 'label': '触发关键词（逗号分隔）',
                                                                         'placeholder': '种子被删除,被删除,被管理员删除,Nuked,被标记,已删除'}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'retention_days', 'label': '回收站记录保留天数（0=永久）',
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'retention_days', 'label': '回收站记录保留天数',
                                                                         'placeholder': '30'}}]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'scan_count', 'label': '扫描条数',
+                                                                        'placeholder': '200'}}]},
                 ]},
             ]}
         ], {
-            "enabled": False,
-            "auto_delete": True,
-            "onlyonce": False,
-            "delete_data": True,
-            "delete_transfer": True,
+            "enabled": False, "auto_delete": True, "onlyonce": False,
+            "delete_data": True, "delete_transfer": True,
             "match_keywords": "种子被删除,被删除,被管理员删除,Nuked,被标记,已删除",
-            "retention_days": 30,
+            "retention_days": 30, "scan_count": 200,
         }
 
     def get_page(self):
@@ -407,12 +443,16 @@ class SiteDelMsgCleaner(_PluginBase):
                                               'class': 'mb-2',
                                               'text': f"回收站审计记录共 {len(recycle)} 条（保留 {self._retention_days} 天）"}},
             {'component': 'VRow', 'props': {'class': 'mb-2'}, 'content': [
-                {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                     {'component': 'VBtn', 'props': {'color': 'primary', 'variant': 'tonal', 'size': 'small'},
+                     'text': '立即扫描（读站点消息历史）',
+                     'events': {'click': {'api': 'plugin/SiteDelMsgCleaner/scan', 'method': 'get',
+                                           'params': {'apikey': settings.API_TOKEN}}}}]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                    {'component': 'VBtn', 'props': {'color': 'secondary', 'variant': 'tonal', 'size': 'small'},
                      'text': '清空回收站记录',
                      'events': {'click': {'api': 'plugin/SiteDelMsgCleaner/clear_recycle', 'method': 'get',
-                                           'params': {'apikey': settings.API_TOKEN}}}},
-                ]},
+                                           'params': {'apikey': settings.API_TOKEN}}}}]},
             ]},
         ]
         if not recycle:
@@ -421,22 +461,26 @@ class SiteDelMsgCleaner(_PluginBase):
         else:
             for r in recycle[:20]:
                 page.append({'component': 'VRow', 'props': {'class': 'mb-1'}, 'content': [
-                    {'component': 'VCol', 'props': {'cols': 2},
-                     'content': [{'component': 'div', 'text': r.get('deleted_at', '')}]},
-                    {'component': 'VCol', 'props': {'cols': 2},
-                     'content': [{'component': 'div', 'text': r.get('site', '')}]},
-                    {'component': 'VCol', 'props': {'cols': 6},
-                     'content': [{'component': 'div', 'text': r.get('name', '')}]},
-                    {'component': 'VCol', 'props': {'cols': 1},
-                     'content': [{'component': 'div', 'text': r.get('downloader', '')}]},
-                    {'component': 'VCol', 'props': {'cols': 1},
-                     'content': [{'component': 'div', 'text': '是' if r.get('delete_data') else '否'}]},
+                    {'component': 'VCol', 'props': {'cols': 2}, 'content': [{'component': 'div', 'text': r.get('deleted_at', '')}]},
+                    {'component': 'VCol', 'props': {'cols': 2}, 'content': [{'component': 'div', 'text': r.get('site', '')}]},
+                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [{'component': 'div', 'text': r.get('name', '')}]},
+                    {'component': 'VCol', 'props': {'cols': 1}, 'content': [{'component': 'div', 'text': r.get('downloader', '')}]},
+                    {'component': 'VCol', 'props': {'cols': 1}, 'content': [{'component': 'div', 'text': '是' if r.get('delete_data') else '否'}]},
                 ]})
         return page
 
     def get_api(self) -> list:
-        return [{"path": "/clear_recycle", "endpoint": self.clear_recycle, "methods": ["GET"],
-                 "summary": "清空回收站审计记录"}]
+        return [
+            {"path": "/scan", "endpoint": self.scan_api, "methods": ["GET"], "summary": "扫描未检测到的删种消息"},
+            {"path": "/clear_recycle", "endpoint": self.clear_recycle, "methods": ["GET"], "summary": "清空回收站审计记录"},
+        ]
+
+    def scan_api(self) -> dict:
+        if not self.get_state():
+            return {"success": False, "message": "插件未启用"}
+        result = self._scan_recent_messages()
+        self._clean_recycle()
+        return {"success": True, **result}
 
     def clear_recycle(self) -> dict:
         self.save_data(self._recycle_key(), [])
