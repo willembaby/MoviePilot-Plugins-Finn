@@ -110,7 +110,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份自动过期清理、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -609,6 +609,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 "total_episode": getattr(s, "total_episode", 0) or 0,
                 "lack_episode": getattr(s, "lack_episode", 0) or 0,
                 "note": getattr(s, "note", "") or "",
+                "start_episode": getattr(s, "start_episode", 0) or 0,
                 "keyword": str(getattr(s, "keyword", "") or ""),
                 "tmdbid": getattr(s, "tmdbid", None),
                 "type": str(getattr(s, "type", "") or ""),
@@ -1343,6 +1344,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
         for r in subs_results:
             sub_info = r.get("sub") or {}
             drop_eps = r.get("drop_eps") or []
+            keep_eps = r.get("keep_eps") or []
             sid = sub_info.get("id")
             if not sid or not drop_eps:
                 continue
@@ -1361,12 +1363,32 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 except Exception:
                     note = []
             merged = sorted(set(note) | set(int(x) for x in drop_eps))
+            upd = {"note": json.dumps(merged)}
+            # 前移订阅 start_episode 到保留窗口最早一集：MP 缺失集按 start_episode 裁剪，
+            # 删掉旧集媒体文件后订阅不会再把它们当缺失重新下载（v1.7 根治重下）。
+            advanced = False
+            cur_start = 0
+            new_start = 0
             try:
-                oper.update(sid, {"note": json.dumps(merged)})
+                cur_start = int(s.get("start_episode") or 0)
+                if keep_eps:
+                    new_start = min(int(x) for x in keep_eps)
+                elif r.get("threshold"):
+                    new_start = int(r.get("threshold"))
+                if new_start and new_start > cur_start:
+                    upd["start_episode"] = new_start
+                    advanced = True
+            except Exception:
+                advanced = False
+            try:
+                oper.update(sid, upd)
                 logger.info(f"订阅剧集自动清理：《{s.get('name')}》已把剔除集号 {self._eps_text(drop_eps)} "
                             f"写入已下载 note，后续不再通过订阅重新下载")
+                if advanced:
+                    logger.info(f"订阅剧集自动清理：《{s.get('name')}》订阅开始集数 {cur_start} → {upd['start_episode']}，"
+                                f"保留窗口之前的旧集不会再被订阅重新下载")
             except Exception as e:
-                logger.error(f"订阅剧集自动清理：更新订阅 {sid} note 失败：{e}")
+                logger.error(f"订阅剧集自动清理：更新订阅 {sid} note/start_episode 失败：{e}")
 
     # ==================== 媒体库硬链接联动 ====================
 
