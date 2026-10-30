@@ -5,8 +5,9 @@
 功能：
 - 针对 MoviePilot「指定的多个订阅电视剧」（可多选）定期（可设 Cron）清理已下载的剧集
 - 只保留最新 N 集（按集号最大），更早的剧集连同下载器数据一起删除（删数据文件 + 退出做种）
-- 删除的剧集号写入订阅 note（已下载集 JSON 列表），MoviePilot 搜索/刷新时将其视为
-  「已下载过」而从缺失集中剔除，不会通过订阅再次重新下载
+- 删除的剧集号写入订阅 note（已下载集 JSON 列表），并把订阅开始集数（start_episode）前移到
+  保留窗口最早一集（v1.7 双保险），MoviePilot 搜索/刷新不再把它们当缺失重新下载；
+  note 中小于开始集数的无效集号会顺带剔除，防无限增长（v1.7.1）
 - 删除时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护，复用跨站清理模式）
 - 删除前回收站备份（支持误删恢复）、回收站过期备份按保留天数自动清理（v1.6，0=永不清理）、含未完成种子跳过、按下载器分批删除
 - 定时自动执行 + 页面手动触发，飞书 Webhook 或系统消息通知
@@ -110,7 +111,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份自动过期清理、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "1.7"
+    plugin_version = "1.7.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -1110,10 +1111,10 @@ class SubscribeEpisodeCleaner(_PluginBase):
         logger.info(f"订阅剧集自动清理：分析完成，共 {len(subs)} 个订阅，种子 {agg['total_torrents']}，"
                     f"待清理 {len(agg['candidates'])}（释放 {self._fmt_size(agg['free_size'])}）")
         if self._auto and agg.get("candidates"):
-            ok, kept, t_stats, o_stats = self._execute(agg["candidates"])
-            # 定时自动清理也发执行回执（v1.4，v1.6 带回收站清理统计）
+            ok, kept, t_stats, o_stats, adv = self._execute(agg["candidates"])
+            # 定时自动清理也发执行回执（v1.4，v1.6 带回收站清理统计，v1.7.1 带开始集数前移）
             if self._notify:
-                self._send_exec_notification(ok, kept, t_stats, o_stats, len(agg["candidates"]), rec_stats)
+                self._send_exec_notification(ok, kept, t_stats, o_stats, len(agg["candidates"]), rec_stats, adv)
         elif self._notify and agg.get("candidates"):
             lines = []
             for r in (agg.get("subs") or []):
@@ -1188,46 +1189,51 @@ class SubscribeEpisodeCleaner(_PluginBase):
         candidates = saved.get("candidates") or []
         if not candidates:
             return {"success": False, "message": "无待清理结果，请先扫描分析"}
-        ok, kept, t_stats, o_stats = self._execute(candidates)
+        ok, kept, t_stats, o_stats, adv = self._execute(candidates)
         # 执行清理后顺带维护回收站（v1.6：刚写入的新备份不会过期，仅清旧备份）
         rec_stats = self._clean_recycle()
-        # 执行回执通知（v1.4：每次执行后必发，含删除/释放/防重下汇总）
+        # 执行回执通知（v1.4：每次执行后必发，含删除/释放/防重下汇总；v1.7.1 带开始集数前移）
         if self._notify:
-            self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates), rec_stats)
+            self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates), rec_stats, adv)
         return {"success": True, "ok": ok, "total": len(candidates),
                 "kept": len(kept), "transfer": t_stats, "orphan": o_stats}
 
     def _send_exec_notification(self, ok: int, kept: List[str], t_stats: Dict[str, int],
-                                 o_stats: Dict[str, int], total: int, rec_stats: Optional[Dict[str, int]] = None):
-        """执行清理后发送回执通知（v1.4；v1.6 附带回收站清理统计）"""
+                                 o_stats: Dict[str, int], total: int, rec_stats: Optional[Dict[str, int]] = None,
+                                 adv: Optional[List[Tuple[str, int, int]]] = None):
+        """执行清理后发送回执通知（v1.4；v1.6 附带回收站清理统计；v1.7.1 附带开始集数前移）"""
         lines = [f"清理完成：删除种子任务 {ok} 个（含辅种级联）"]
         if kept:
             lines.append(f"因数据共享保留：{len(kept)} 个")
         if t_stats:
             lines.append(f"整理联动：转移记录 {t_stats.get('records', 0)} 条 / 媒体文件 {t_stats.get('files', 0)} 个"
-                         + (f" / 跳过 {t_stats.get('skipped', 0)} 个" if t_stats.get('skipped') else ""))
+                         + (f" / 跳过 {t_stats.get('skipped', 0)} 个" if t_stats.get("skipped") else ""))
         if o_stats:
             lines.append(f"旧集媒体清理：视频及附属 {o_stats.get('files', 0)} 个 / 转移记录 {o_stats.get('records', 0)} 条")
         if rec_stats and rec_stats.get("removed"):
             lines.append(f"回收站维护：清理过期备份 {rec_stats['removed']} 条"
                          f"（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
         saved = self.get_data("result") or {}
+        adv_map = {str(n): (int(o), int(v)) for n, o, v in (adv or [])}  # v1.7.1 开始集数前移映射
         sub_lines = []
         for r in (saved.get("subs") or []):
             sub = r.get("sub") or {}
             kept_eps = r.get("keep_eps") or []
             if kept_eps:
-                sub_lines.append(f"▶ 《{sub.get('name')}》保留最新 {len(kept_eps)} 集（{self._eps_text(kept_eps)}）")
+                name = str(sub.get("name"))
+                extra = f"｜开始集数 {adv_map[name][0]}→{adv_map[name][1]}" if name in adv_map else ""
+                sub_lines.append(f"▶ 《{name}》保留最新 {len(kept_eps)} 集（{self._eps_text(kept_eps)}）{extra}")
         if sub_lines:
             lines.append("各订阅保留窗口：")
             lines.extend(f"  {l}" for l in sub_lines)
         text = f"{self._notify_title_prefix}: 订阅剧集自动清理-执行回执\n" + "\n".join(lines)
-        text += "\n已删除集号已写入订阅 note，不会被订阅重新下载。"
+        text += "\n已删除集号已写入订阅 note" + ("并前移开始集数" if adv else "") + "，不会被订阅重新下载。"
         self._send_notification(text)
 
-    def _execute(self, candidates: List[Dict]) -> Tuple[int, List[str], Dict[str, int]]:
+    def _execute(self, candidates: List[Dict]) -> Tuple[int, List[str], Dict[str, int], Dict[str, int], List[Tuple[str, int, int]]]:
         """执行删除：按下载器分批删数据+退出做种，备份回收站，清理媒体库硬链接与转移记录；
-        更新各订阅 note 防重下。返回 (成功数, 仅删任务提示, 整理联动统计)"""
+        更新各订阅 note 与 start_episode 防重下。返回 (成功数, 仅删任务提示, 整理联动统计,
+        旧集清理统计, 开始集数前移记录)"""
         # 多订阅可能命中同一种子，按种子 ID 去重
         uniq: Dict[str, Dict] = {}
         for c in candidates:
@@ -1325,21 +1331,24 @@ class SubscribeEpisodeCleaner(_PluginBase):
         if o_stats and (o_stats.get("files") or o_stats.get("records")):
             logger.info(f"订阅剧集自动清理：旧集媒体清理完成 媒体文件 {o_stats.get('files', 0)} 个 / "
                         f"转移记录 {o_stats.get('records', 0)} 条")
-        # 更新订阅 note：把这些剔除的集号标记为"已下载过"，防止重下
-        self._mark_episodes_done()
-        return ok, kept, t_stats, o_stats
+        # 更新订阅 note 与 start_episode：把这些剔除的集号标记为"已下载过"，防止重下
+        adv = self._mark_episodes_done()
+        return ok, kept, t_stats, o_stats, adv
 
-    def _mark_episodes_done(self):
-        """把每个订阅本次剔除的集号写入各自订阅 note（JSON 列表），MP 将其视为已下载不再补下。"""
+    def _mark_episodes_done(self) -> List[Tuple[str, int, int]]:
+        """把每个订阅本次剔除的集号写入各自订阅 note（JSON 列表），并前移 start_episode 到保留窗口
+        最早一集；注：note 中小于开始集数的无效集号顺带剔除（v1.7.1）。返回开始集数前移记录
+        [(订阅名, 旧值, 新值), ...]，供执行回执展示。"""
+        adv_changes: List[Tuple[str, int, int]] = []
         saved = self.get_data("result") or {}
         subs_results = saved.get("subs") or []
         if not subs_results:
-            return
+            return adv_changes
         try:
             from app.db.subscribe_oper import SubscribeOper
         except Exception as e:
             logger.error(f"订阅剧集自动清理：无法访问订阅库：{e}")
-            return
+            return adv_changes
         oper = SubscribeOper()
         for r in subs_results:
             sub_info = r.get("sub") or {}
@@ -1363,7 +1372,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 except Exception:
                     note = []
             merged = sorted(set(note) | set(int(x) for x in drop_eps))
-            upd = {"note": json.dumps(merged)}
+            upd = {}
             # 前移订阅 start_episode 到保留窗口最早一集：MP 缺失集按 start_episode 裁剪，
             # 删掉旧集媒体文件后订阅不会再把它们当缺失重新下载（v1.7 根治重下）。
             advanced = False
@@ -1380,6 +1389,15 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     advanced = True
             except Exception:
                 advanced = False
+            # v1.7.1 note 卫生清洗：开始集数之前的集号已被裁剪，留在 note 里无意义，
+            # 剔除以防列表随删集无限增长（如历史垃圾集号 0）。
+            final_start = int(upd.get("start_episode") or cur_start or 0)
+            if final_start > 0:
+                cleaned = [e for e in merged if e >= final_start]
+            else:
+                cleaned = merged
+            removed_cnt = len(merged) - len(cleaned)
+            upd["note"] = json.dumps(cleaned)
             try:
                 oper.update(sid, upd)
                 logger.info(f"订阅剧集自动清理：《{s.get('name')}》已把剔除集号 {self._eps_text(drop_eps)} "
@@ -1387,8 +1405,15 @@ class SubscribeEpisodeCleaner(_PluginBase):
                 if advanced:
                     logger.info(f"订阅剧集自动清理：《{s.get('name')}》订阅开始集数 {cur_start} → {upd['start_episode']}，"
                                 f"保留窗口之前的旧集不会再被订阅重新下载")
+                if removed_cnt > 0:
+                    logger.info(f"订阅剧集自动清理：《{s.get('name')}》note 卫生清洗：剔除 {removed_cnt} 个"
+                                f"小于开始集数 {final_start} 的无效集号")
             except Exception as e:
                 logger.error(f"订阅剧集自动清理：更新订阅 {sid} note/start_episode 失败：{e}")
+                continue
+            if advanced:
+                adv_changes.append((str(s.get("name")), int(cur_start), int(upd["start_episode"])))
+        return adv_changes
 
     # ==================== 媒体库硬链接联动 ====================
 
@@ -1492,6 +1517,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     drop_eps = {int(x) for x in (r.get("drop_eps") or [])}
                     if not title or not drop_eps:
                         continue
+                    sub_stats = {"files": 0, "records": 0}  # v1.7.1 按订阅重置，修日志串号
                     rows = list(session.execute(
                         select(TransferHistory).where(TransferHistory.title == title)).scalars().all()) or []
                     dest_dirs = set()
@@ -1506,7 +1532,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     for rec in del_records:
                         try:
                             session.delete(rec)
-                            stats["records"] += 1
+                            sub_stats["records"] += 1
                         except Exception as e:
                             logger.warning(f"订阅剧集自动清理：旧集转移记录删除失败 #{getattr(rec, 'id', '?')}：{e}")
                     session.commit()
@@ -1528,11 +1554,13 @@ class SubscribeEpisodeCleaner(_PluginBase):
                             try:
                                 if os.path.isfile(p):
                                     os.remove(p)
-                                    stats["files"] += 1
+                                    sub_stats["files"] += 1
                             except Exception as e:
                                 logger.warning(f"订阅剧集自动清理：旧集媒体文件删除失败 {p}：{e}")
-                    logger.info(f"订阅剧集自动清理：《{title}》旧集清理完成：媒体文件 {stats['files']} 个，"
-                                f"转移记录 {stats['records']} 条")
+                    stats["files"] += sub_stats["files"]
+                    stats["records"] += sub_stats["records"]
+                    logger.info(f"订阅剧集自动清理：《{title}》旧集清理完成：媒体文件 {sub_stats['files']} 个，"
+                                f"转移记录 {sub_stats['records']} 条")
         except Exception as e:
             logger.error(f"订阅剧集自动清理：旧集媒体清理执行异常：{e}")
         return stats
