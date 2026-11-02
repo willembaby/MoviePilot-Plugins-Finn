@@ -1,4 +1,20 @@
 {
+  "SubscribeCalendarMonitor": {
+    "name": "订阅日历监控",
+    "description": "每日定时检查\"当日播出\"的订阅剧集是否已下载入库，并发送通知（飞书 webhook 或系统消息）；支持仅缺失时通知、自定义检查 Cron 与通知前缀。V3 专用版：订阅身份由 tmdbid 迁移到 media_source/media_id（仅 TMDB 来源参与日历比对），导入迁移到 app.sdk 稳定入口。",
+    "labels": "订阅",
+    "version": "2.0.0",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png",
+    "author": "Finn",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v2.0.0": "V3 专用版：订阅身份由 tmdbid 迁移到 media_source/media_id 身份对（仅 TMDB 来源参与日历比对，非 TMDB 来源跳过）；订阅读取改用 app.db.oper.subscribe.SubscribeOper（替代旧 Oper 路径）；导入迁移到 app.sdk（config/logging/plugin.base）；链调用（TmdbChain.tmdb_episodes / SubscribeChain.subscribe_files_info）沿用 V3 门面，日历比对与入库判定逻辑保持一致",
+      "v1.2": "配置页按新排版重排：开关/检查 Cron/通知前缀/飞书 Webhook 分区，修复开关文字换行与列宽失衡；调度器补充 start() 修复「立即运行一次」从未真正执行的 bug",
+      "v1.1": "引入非 TMDB 来源过滤与结果报告：当日无播出计划也输出报告",
+      "v1.0": "首个版本：每日定时检查当日播出订阅剧集是否已下载入库，飞书/系统通知"
+    }
+  },
   "CrossSeedCleaner": {
     "name": "跨站独苗种子清理",
     "description": "按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数：仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；条目带站点名与最新上传日期，结果可按最新上传时间排序；删数据时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护）；支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复（按保留天数自动过期清理）、定时与手动触发，删除通知按站点汇总清理数量与释放空间。V3 专用版：数据库访问迁移到 app.db.oper 合同，导入迁移到 app.sdk 稳定入口。",
