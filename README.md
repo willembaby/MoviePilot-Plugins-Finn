@@ -1,8 +1,8 @@
 ﻿# MoviePilot 自定义插件包
 
-包含七个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种 / 跨站独苗种子 / 订阅剧集过期集的清理维护。
+包含八个针对「订阅剧集追更」与「下载器维护」场景的自定义插件，解决国内影视平台数据与 TMDB 不一致导致的订阅问题，以及下载器数据文件的空壳种子 / 孤儿文件 / 站点已删除死种 / 跨站独苗种子 / 订阅剧集过期集 / 站点删种消息的清理维护。
 
-> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 7 个插件文件）。
+> 作者信息默认为 `Finn`；如需以自己的名义发布，请修改源码中的 `plugin_author` 与 `author_url` 两处字段（共 8 个插件文件）。
 
 ## 插件列表
 
@@ -147,15 +147,37 @@
 
 ---
 
+### 8. 站点删种消息自动清理（SiteDelMsgCleaner）v1.1.0
+
+**解决痛点**：站点删除种子/违规清种后，MoviePilot 推送「种子被删除」站内信，但下载器中的对应死种任务与数据文件仍残留，需要人工逐条处理。
+
+**核心能力**：
+- **消息监听**：订阅 MoviePilot 内置「站点数据刷新解析未读站内信」推送的站点消息（`EventType.NoticeMessage`，`mtype=站点`），检测到「种子被删除」类站内信自动处理
+- **自动清理**：命中后自动删除对应下载器种子 + 数据源文件 + 转移记录（transferhistory）
+- **跨站共享保护**：数据文件仍被其他站点种子引用时自动降级为仅删任务、保留数据文件
+- **降错跳过**：识别不到种子名或未命中下载器时跳过，不影响其他任务
+- **回收站审计**：删除动作写入回收站审计记录，按可设保留天数自动清理（0=永久）
+- **双模式**：支持 `自动删除 / 仅记录` 两种模式
+- **兜底扫描（v1.1.0）**：修复启用后「立即运行一次」把配置冲掉导致插件实际未生效的问题；「立即运行一次」改为读 message 表最近站点消息做兜底扫描，处理启用前漏掉的删种消息（持久化去重防重复）；新增 `/scan` 手动扫描 API 与「扫描条数」配置，页面增加扫描按钮
+- **清理后回执**：飞书/系统通知
+
+**配置项**：启用、自动删除/仅记录模式、扫描条数、回收站审计保留天数（0=永久）、飞书 Webhook、通知前缀、立即运行一次。
+
+**版本历史**：v1.0.0 首发（订阅 NoticeMessage 事件自动删种子+数据源文件+转移记录，跨站共享保护，回收站审计滚动，自动/仅记录双模式）；v1.1.0 修复「立即运行一次」配置被冲掉的问题（onlyonce 重置改合并写配置）、新增兜底扫描（读 message 表处理启用前漏掉的删种消息，持久化去重）与 `/scan` API、扫描条数配置。
+
+**依赖**：MoviePilot v2（订阅 NoticeMessage 事件机制 + DownloaderHelper）；需开启「站点数据刷新解析未读站内信」推送。
+
+---
+
 ## 安装方式
 
 ### 方式一：zip 本地安装（最简单）
 
 1. 解压本包，或在 MoviePilot 插件页面使用「本地安装/上传 zip」
-2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/`、`sitedeletedtorrentcleaner/`、`crossseedcleaner/` 和 `subscribeepisodecleaner/` 七个目录
+2. 若不支持 zip 安装：将 `subscribecompletioncrosscheck/`、`subscribecalendarmonitor/`、`torrentfilecleaner/`、`orphanfilecleaner/`、`sitedeletedtorrentcleaner/`、`crossseedcleaner/`、`subscribeepisodecleaner/` 和 `sitedelmsgcleaner/` 八个目录
    直接复制到 MoviePilot 容器的 `/app/app/plugins/` 下
 3. 在 MoviePilot 的 `systemconfig` 表（PostgreSQL）的 `UserInstalledPlugins` 配置中
-    追加插件类名：`SubscribeCompletionCrossCheck`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`、`CrossSeedCleaner`、`SubscribeEpisodeCleaner`
+    追加插件类名：`CrossSeedCleaner`、`SubscribeCompletionCrossCheck`、`SubscribeEpisodeCleaner`、`SubscribeCalendarMonitor`、`TorrentFileCleaner`、`OrphanFileCleaner`、`SiteDeletedTorrentCleaner`、`SiteDelMsgCleaner`
 4. 重启 MoviePilot 容器，插件市场即可看到插件并配置
 
 ### 方式二：GitHub 插件仓库（推荐，支持自动更新）
@@ -174,7 +196,7 @@
 
 ## MoviePilot V3 专用版本（plugins.v3）
 
-本仓库自 2026-11 起提供 3 个插件的 MoviePilot V3 专用版本，位于 `plugins.v3/` 目录，
+本仓库自 2026-11 起提供 4 个插件的 MoviePilot V3 专用版本，位于 `plugins.v3/` 目录，
 索引文件为 `package.v3.json`（声明 `system_version: ">=3.0.0"`）：
 
 | 插件 | V2 版本 | V3 版本 | 迁移要点 |
@@ -182,11 +204,9 @@
 | 跨站独苗种子清理（CrossSeedCleaner） | 1.9 | 2.0.0 | 数据库访问迁移 `app.db.oper`（整理联动 TransferHistoryOper 分页查询），导入迁移 `app.sdk` |
 | 订阅完结交叉校验（SubscribeCompletionCrossCheck） | 1.6 | 2.0.0 | 订阅身份迁移 media_source/media_id 身份对；完结否决事件适配 V3 契约；豆瓣校验沿用 V3 内置 DoubanApi（总集数与"更新至X集"连载状态判定保留） |
 | 订阅剧集自动清理（SubscribeEpisodeCleaner） | 1.7.1 | 2.0.0 | 订阅/下载历史/整理历史/消息迁移 Oper；身份对迁移；note 为 JSON 列直写；防重下双保险（note + start_episode 前移）保持一致 |
+| 订阅日历监控（SubscribeCalendarMonitor） | 1.2 | 2.0.0 | 订阅身份由 tmdbid 迁移 media_source/media_id（仅 TMDB 来源参与日历比对）；订阅读取改 app.db.oper.subscribe；导入迁移 app.sdk |
 
 - V2 版本（`plugins/` + `package.json`）保持不动，`"v3": false` 声明防止 V3 宿主回退加载旧合同实现。
 - V3 宿主按 `package.v3.json` 加载新实现；V2 用户不受影响。
-- 其余插件（订阅日历监控、种子文件清理、孤儿文件清理、站点已删除种子清理、站点删种消息自动清理）
-  未直接访问宿主数据模型，按官方兼容层继续在 V2 使用，暂无 V3 专用副本。
-- 已在独立 V3 测试容器完成端到端验证：3 插件加载/表单/定时注册正常；
-  真实下载器 4817 种子全量扫描、站点名解析、独苗判定、别名挖掘、集号解析、
-  保留窗口与候选生成、豆瓣/Bangumi 真实接口交叉校验全部通过。
+- 其余插件（种子文件清理、孤儿文件清理、站点已删除种子清理、站点删种消息自动清理）未直接访问宿主数据模型，经 V3 测试容器实测可正常加载，已按官方适配规范在 `package.json` 条目声明 `"v3": true`（单代码库双宿主，V2/V3 共用一份代码）。
+- 已在独立 V3 测试容器完成端到端验证：4 个 V3 专用版插件加载/表单/定时注册正常，订阅日历监控真实检查链路（media_source/media_id 身份转换 + TMDB 播出查询 + 入库比对）跑通；4 个 `v3:true` 兼容插件加载零错误；跨站独苗清理的真实下载器 4817 种子全量扫描、站点名解析、独苗判定、别名挖掘、集号解析、保留窗口与候选生成、豆瓣/Bangumi 真实接口交叉校验全部通过。
