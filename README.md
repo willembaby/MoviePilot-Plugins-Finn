@@ -171,3 +171,22 @@
 - 兼容性：基于 MoviePilot v2 API 开发；MoviePilot v3（新架构）可能需要适配
 
 
+
+## MoviePilot V3 专用版本（plugins.v3）
+
+本仓库自 2026-11 起提供 3 个插件的 MoviePilot V3 专用版本，位于 `plugins.v3/` 目录，
+索引文件为 `package.v3.json`（声明 `system_version: ">=3.0.0"`）：
+
+| 插件 | V2 版本 | V3 版本 | 迁移要点 |
+| --- | --- | --- | --- |
+| 跨站独苗种子清理（CrossSeedCleaner） | 1.9 | 2.0.0 | 数据库访问迁移 `app.db.oper`（整理联动 TransferHistoryOper 分页查询），导入迁移 `app.sdk` |
+| 订阅完结交叉校验（SubscribeCompletionCrossCheck） | 1.6 | 2.0.0 | 订阅身份迁移 media_source/media_id 身份对；完结否决事件适配 V3 契约；豆瓣校验沿用 V3 内置 DoubanApi（总集数与"更新至X集"连载状态判定保留） |
+| 订阅剧集自动清理（SubscribeEpisodeCleaner） | 1.7.1 | 2.0.0 | 订阅/下载历史/整理历史/消息迁移 Oper；身份对迁移；note 为 JSON 列直写；防重下双保险（note + start_episode 前移）保持一致 |
+
+- V2 版本（`plugins/` + `package.json`）保持不动，`"v3": false` 声明防止 V3 宿主回退加载旧合同实现。
+- V3 宿主按 `package.v3.json` 加载新实现；V2 用户不受影响。
+- 其余插件（订阅日历监控、种子文件清理、孤儿文件清理、站点已删除种子清理、站点删种消息自动清理）
+  未直接访问宿主数据模型，按官方兼容层继续在 V2 使用，暂无 V3 专用副本。
+- 已在独立 V3 测试容器完成端到端验证：3 插件加载/表单/定时注册正常；
+  真实下载器 4817 种子全量扫描、站点名解析、独苗判定、别名挖掘、集号解析、
+  保留窗口与候选生成、豆瓣/Bangumi 真实接口交叉校验全部通过。
