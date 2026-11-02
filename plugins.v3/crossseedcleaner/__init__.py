@@ -1,0 +1,1724 @@
+﻿# -*- coding: utf-8 -*-
+"""
+跨站独苗种子清理插件 (CrossSeedCleaner)
+
+功能：
+- 扫描 MoviePilot 已配置下载器 + 自定义下载器（qBittorrent / Transmission）中的全部种子
+- 按「同一内容」聚合（种子名称或数据路径分组），统计该内容在哪些站点做种
+- 判定"单站独苗"：某内容只有 1 个站点做种 → 删除种子（可选删除数据文件）
+- 多站做种的内容自动保留（跨站保流）
+- 保护规则：未完成种子跳过、保护站点白名单、保护关键词、累计上传量阈值
+- 删除前自动备份种子到回收站（qB 导出 .torrent / TR 记录磁力链），支持一键恢复
+- 数据文件辅种保护：数据仍被本次删除范围之外的种子引用时自动降级为仅删任务
+- 整理联动：删除数据文件时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护）
+- 定时扫描（可配自动清理）+ 页面手动触发，飞书 Webhook 或系统消息通知
+"""
+
+import hashlib
+import time
+import os
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
+
+import pytz
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.sdk.config import settings
+from app.sdk.services import DownloaderHelper
+from app.sdk.logging import logger
+from app.sdk.plugin.base import _PluginBase
+
+# qBittorrent 视为"未完成/进行中"的状态
+_QB_ACTIVE_STATES = {
+    "downloading", "stalledDL", "metaDL", "checkingDL", "forcedDL",
+    "allocating", "checkingResumeData", "moving", "forcedMetaDL",
+}
+
+
+def host_of(url: str) -> str:
+    """URL -> 主机名"""
+    try:
+        if not url:
+            return ""
+        if "://" not in url:
+            url = "http://" + str(url)
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def site_key(url_or_host: str) -> str:
+    """tracker URL / 主机名 -> 站点主域 key（取最后两段，跨 announce 前缀去重）"""
+    if not url_or_host:
+        return ""
+    s = str(url_or_host).strip().lower()
+    h = host_of(s) if "://" in s else s.split("/")[0]
+    h = h.split(":")[0]
+    parts = [p for p in h.split(".") if p]
+    if len(parts) >= 2:
+        return parts[-2] + "." + parts[-1]
+    return h
+
+
+def analyze_items(items: dict, group_by: str = "name") -> dict:
+    """
+    核心分组分析（纯函数，便于测试）。
+    items: {hash: {"name","size","sites"(list),"data_id",...}}
+    返回 {"groups": {gkey: {"entries": [...], "sites": set(), "name", "path"}},
+          "keep": [gkey...], "single": [gkey...]}
+    """
+    groups: Dict[str, dict] = {}
+    for h, it in (items or {}).items():
+        key = ""
+        if group_by == "path":
+            key = str(it.get("data_id") or "")
+        if not key:
+            key = str(it.get("name") or "")
+        g = groups.setdefault(key, {"entries": [], "sites": set(), "name": it.get("name", ""),
+                                    "path": it.get("data_id", "")})
+        g["entries"].append(dict(it, _key=h))
+        for s in (it.get("sites") or []):
+            if s:
+                g["sites"].add(s)
+    keep, single = [], []
+    for gk, g in groups.items():
+        if len(g["sites"]) >= 2:
+            keep.append(gk)
+        else:
+            single.append(gk)
+    return {"groups": groups, "keep": keep, "single": single}
+
+
+class CrossSeedCleaner(_PluginBase):
+    """
+    跨站独苗种子清理插件
+    """
+
+    plugin_name = "跨站独苗种子清理"
+    plugin_desc = ("按内容聚合下载器种子（qBittorrent/Transmission），统计站点做种数："
+                   "仅 1 个站点做种的独苗内容清理（可选删数据），多站做种自动保留（跨站保流）；"
+                   "条目带站点名与最新上传日期，结果可按最新上传时间排序；"
+                   "删数据时同步清理媒体库硬链接文件与转移记录（带共享引用/链接数双重保护）；"
+                   "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
+                   "删除通知按站点汇总清理数量与释放空间。")
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
+    plugin_version = "2.0.0"
+    plugin_author = "Finn"
+    author_url = "https://github.com"
+    plugin_config_prefix = "crossseedcleaner_"
+    plugin_order = 36
+    auth_level = 1
+
+    # 配置（私有）
+    _enabled = False
+    _onlyonce = False
+    _cron = "0 4 * * *"
+    _delete_file = False          # 是否删除数据文件（否则仅删任务）
+    _auto_delete = False          # 定时扫描后是否自动清理
+    _notify = True
+    _webhook = ""
+    _notify_title_prefix = "HA通知"
+    _group_by = "name"            # 聚合方式：name=种子名称 / path=数据路径
+    _skip_active = True           # 含未完成种子的独苗组跳过（不删）
+    _protected_sites = ""         # 保护站点（逗号分隔站点名/域名，独苗站点命中则保留）
+    _protected_keywords = ""      # 保护关键词（每行一个，种子名命中则整组保留）
+    _protect_uploaded_gb = 0      # 累计上传量保护阈值 GB（0 同样生效：仅清理从未上传过的种子）
+    _recycle_enabled = True       # 删除前备份种子（支持误删恢复）
+    _recycle_retention_days = 30  # 回收站备份保留天数（超过自动清理，0=永不清理）（v1.9）
+    _clean_media_links = True     # 删数据时同步清理媒体库硬链接文件与转移记录
+    _custom_downloaders = ""      # 自定义下载器，每行：类型|地址|端口|用户名|密码
+    _scheduler = None
+    _sel: List[str] = []
+    _sort_order = "asc"           # 结果排序：asc=最新上传 旧→新（最久未传在前）/ desc=新→旧
+    _view_mode = "group"          # 结果视图：group=按内容组 / downloader=按下载器分组
+    _site_map_cache: Optional[Dict[str, str]] = None
+
+    # 内置常见 PT 站点 tracker 主域 -> 站点名（实测映射，MP 站点表优先生效）
+    BUILTIN_SITE_MAP = {
+        "springsunday.net": "SpringSunday",
+        "m-team.cc": "馒头M-Team",
+        "pterclub.net": "飘雪PTerClub",
+        "btschool.club": "BT学校",
+        "zmpt.cc": "猪猪ZMPT",
+        "hdfans.org": "HDFans",
+        "soulvoice.club": "SoulVoice",
+        "audiences.me": "Audiences观众",
+        "cinefiles.info": "Cinefiles",
+        "hdarea.club": "HDArea高清地带",
+        "hdtime.org": "HDTime高清时光",
+        "pthome.org": "PTHome",
+        "carpt.net": "CarPT",
+        "totheglory.im": "ToTheGlory",
+        "hddolby.com": "HDDolby",
+        "ubits.club": "uBits",
+        "hdhome.org": "HDHome",
+        "pandapt.net": "熊猫PandaPT",
+        "cyanbug.net": "青虫CyanBug",
+        "rousi.pro": "肉丝Rousi",
+        "open.cd": "皇后OpenCD",
+        "keepfrds.com": "FRDS",
+        "zhuque.in": "朱雀Zhuque",
+        "hhanclub.net": "HHanClub",
+        "1ptba.com": "1PTBA",
+        "ptsbao.club": "PTSbao",
+        "hdsky.me": "HD影Sky",
+        "0ff.cc": "OFF",
+        "discfan.xyz": "碟粉DiscFan",
+        "52pt.site": "52PT",
+        "xingtan.one": "星坛XingTan",
+        "haidan.video": "海豚Haidan",
+        "htpt.cc": "HTTPT",
+        "gamegamept.com": "GameGame",
+        "greatposterwall.com": "GreatPosterWall",
+        "eastgame.org": "EastGame",
+        "nicept.net": "NicePT",
+        "pttime.org": "PTTime",
+    }
+
+    # ==================== 生命周期 ====================
+
+    def init_plugin(self, config: dict = None):
+        legacy_pv = False  # 旧版 protected_sites 为文本字符串（含空串）→ 需迁移为列表存储
+        if config:
+            self._enabled = config.get("enabled", False)
+            self._onlyonce = config.get("onlyonce", False) or False
+            self._cron = config.get("cron") or "0 4 * * *"
+            self._delete_file = bool(config.get("delete_file", False))
+            self._auto_delete = bool(config.get("auto_delete", False))
+            self._notify = bool(config.get("notify", True))
+            self._webhook = config.get("webhook", "")
+            self._notify_title_prefix = config.get("notify_title_prefix") or "HA通知"
+            self._group_by = (config.get("group_by") or "name").strip() or "name"
+            if self._group_by not in ("name", "path"):
+                self._group_by = "name"
+            self._skip_active = bool(config.get("skip_active", True))
+            pv = config.get("protected_sites", "")
+            if isinstance(pv, list):
+                self._protected_sites = ",".join(str(x).strip() for x in pv if str(x).strip())
+            else:
+                # 旧版字符串格式（含空串，前端多选框会渲染成异常空标签）→ 归一化并回写为列表
+                self._protected_sites = str(pv or "").strip()
+                legacy_pv = True
+            self._protected_keywords = config.get("protected_keywords", "") or ""
+            try:
+                self._protect_uploaded_gb = float(config.get("protect_uploaded_gb") or 0)
+            except Exception:
+                self._protect_uploaded_gb = 0
+            self._recycle_enabled = bool(config.get("recycle_enabled", True))
+            try:
+                self._recycle_retention_days = max(int(config.get("recycle_retention_days") or 30), 0)
+            except Exception:
+                self._recycle_retention_days = 30
+            self._clean_media_links = bool(config.get("clean_media_links", True))
+            self._custom_downloaders = config.get("custom_downloaders") or ""
+        self._sel = []
+        self._sort_order = "asc"
+        self._view_mode = "group"
+
+        if legacy_pv:
+            # 一次性迁移：把旧字符串格式（含空串）写回为纯净空列表，消除配置页空白 chip
+            self.__update_config()
+
+        self.__stop_service()
+
+        if self._enabled:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            try:
+                self._scheduler.add_job(
+                    func=self._schedule_scan,
+                    trigger=CronTrigger.from_crontab(self._cron),
+                    name="跨站独苗种子清理",
+                )
+                logger.info(f"跨站独苗种子清理定时任务注册成功：cron={self._cron}")
+            except Exception as e:
+                logger.error(f"跨站独苗种子清理定时任务注册失败：{e}")
+
+            if self._onlyonce:
+                logger.info("跨站独苗种子清理服务启动，立即运行一次")
+                self._scheduler.add_job(
+                    func=self._schedule_scan,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=5),
+                    name="跨站独苗种子清理-立即运行",
+                )
+                self._onlyonce = False
+                self.__update_config()
+
+            if self._scheduler.get_jobs():
+                self._scheduler.start()
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        pass
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {"path": "/scan", "endpoint": self.scan_api, "methods": ["GET"], "summary": "扫描分析独苗种子"},
+            {"path": "/toggle", "endpoint": self.toggle_api, "methods": ["GET"], "summary": "切换条目勾选"},
+            {"path": "/toggle_group", "endpoint": self.toggle_group_api, "methods": ["GET"], "summary": "按组勾选/取消"},
+            {"path": "/toggle_all", "endpoint": self.toggle_all_api, "methods": ["GET"], "summary": "一键勾选全部"},
+            {"path": "/delete", "endpoint": self.delete_api, "methods": ["GET"], "summary": "删除单条"},
+            {"path": "/delete_selected", "endpoint": self.delete_selected_api, "methods": ["GET"], "summary": "删除勾选条目"},
+            {"path": "/delete_all", "endpoint": self.delete_all_api, "methods": ["GET"], "summary": "删除全部独苗"},
+            {"path": "/sort", "endpoint": self.sort_api, "methods": ["GET"], "summary": "切换结果排序(按最新上传时间)"},
+            {"path": "/view", "endpoint": self.view_api, "methods": ["GET"], "summary": "切换结果视图(内容组/下载器)"},
+            {"path": "/clear", "endpoint": self.clear_api, "methods": ["GET"], "summary": "清空扫描结果"},
+            {"path": "/restore", "endpoint": self.restore_api, "methods": ["GET"], "summary": "从回收站恢复误删种子"},
+            {"path": "/recycle_delete", "endpoint": self.recycle_delete_api, "methods": ["GET"], "summary": "清除回收站单条备份"},
+            {"path": "/recycle_clear", "endpoint": self.recycle_clear_api, "methods": ["GET"], "summary": "清空回收站"},
+            {"path": "/clean_recycle", "endpoint": self.clean_recycle_api, "methods": ["GET"], "summary": "清理回收站过期备份（按保留天数）"},
+        ]
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        # 保护站点多选下拉选项：优先读 MoviePilot 站点管理的站点名，无站点时回退内置表
+        site_names = sorted({n for n in self._site_name_map().values() if n})
+        if not site_names:
+            site_names = sorted(set(self.BUILTIN_SITE_MAP.values()))
+        site_items = [{'title': n, 'value': n} for n in site_names]
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'notify', 'label': '发送通知'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'delete_file', 'label': '允许删除数据文件（独苗清理释放空间的核心）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'clean_media_links', 'label': '同步清理媒体库硬链接与转移记录（仅对删了数据的种子生效）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'auto_delete', 'label': '定时扫描后自动清理（不勾选则仅分析通知）'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'recycle_enabled', 'label': '删除前备份种子到回收站（支持误删恢复）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'recycle_retention_days', 'label': '回收站备份保留天数（超期自动清理，0=永不清理）', 'placeholder': '30'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'skip_active', 'label': '含未完成种子的组跳过（下载/校验中不删）'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSelect', 'props': {'model': 'group_by', 'label': '内容聚合方式', 'items': [
+                                 {'title': '按种子名称（推荐）', 'value': 'name'},
+                                 {'title': '按数据路径（跨下载器挂载一致时更严格）', 'value': 'path'},
+                             ]}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'cron', 'label': '执行周期(Cron)', 'placeholder': '0 4 * * *（每天4点）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                              'content': [{'component': 'VTextField', 'props': {'model': 'protect_uploaded_gb', 'label': '累计上传保护阈值GB（组内累计上传≥阈值整组保留；0=仅清理从未上传过的种子）', 'placeholder': '0'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VSelect', 'props': {'model': 'protected_sites', 'label': '保护站点（多选，选项读自站点管理；独苗站点命中不删）', 'multiple': True, 'chips': True, 'closableChips': True, 'clearable': True, 'items': site_items}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'notify_title_prefix', 'label': '通知前缀', 'placeholder': 'HA通知'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'webhook', 'label': '飞书 Webhook（留空走系统消息）', 'placeholder': 'https://open.feishu.cn/open-apis/bot/v2/hook/xxx'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                             'content': [{'component': 'VTextarea', 'props': {'model': 'custom_downloaders', 'label': '自定义下载器（每行：类型|地址|端口|用户名|密码，类型 qbittorrent/transmission；留空则仅用 MoviePilot 已配置下载器）', 'rows': 2, 'placeholder': 'qbittorrent|192.168.10.11|8080|admin|pass\ntransmission|192.168.10.11|9091|admin|pass'}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                             'content': [{'component': 'VTextarea', 'props': {'model': 'protected_keywords', 'label': '保护关键词（每行一个，种子名命中则整组保留）', 'rows': 3}}]},
+                        ]
+                    },
+                ]
+            }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "cron": "0 4 * * *",
+            "delete_file": False,
+            "auto_delete": False,
+            "notify": True,
+            "webhook": "",
+            "notify_title_prefix": "HA通知",
+            "group_by": "name",
+            "skip_active": True,
+            "protected_sites": [],
+            "protected_keywords": "",
+            "protect_uploaded_gb": 0,
+            "recycle_enabled": True,
+            "recycle_retention_days": 30,
+            "clean_media_links": True,
+            "custom_downloaders": "",
+        }
+
+    # ==================== 页面 ====================
+
+    def get_page(self) -> Optional[List[dict]]:
+        if not self._enabled:
+            return [{'component': 'VAlert', 'props': {'type': 'warning', 'text': '插件未启用，请先到「设置」页启用', 'variant': 'tonal'}}]
+
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        scan_time = saved.get("time", "")
+        stat = saved.get("stat") or {}
+        selected = set(self._sel)
+
+        # 组排序：按组内最新上传时间；0=从未上传视为最冷。默认旧→新（最久未传的组在前，优先清理参考）
+        rev = (self._sort_order == "desc")
+
+        def _g_latest(g: dict) -> int:
+            try:
+                return max([int(e.get("upload_time") or 0) for e in g.get("entries", [])] or [0])
+            except Exception:
+                return 0
+
+        groups = sorted(groups, key=_g_latest, reverse=rev)
+        sort_label = "排序:最新上传 新→旧" if rev else "排序:最新上传 旧→新"
+        view_label = "视图:按下载器" if self._view_mode == "group" else "视图:按内容组"
+
+        page = []
+        page.append({
+            'component': 'VAlert',
+            'props': {'type': 'info', 'variant': 'tonal', 'density': 'compact', 'class': 'mb-2',
+                      'text': (f"分析时间：{scan_time or '尚未扫描'}   种子总数 {stat.get('total', 0)}   "
+                               f"多站保留 {stat.get('keep_groups', 0)} 组   独苗待清理 {len(groups)} 组"
+                               f"({stat.get('del_seeds', 0)} 种子/{self._fmt_size(stat.get('del_size', 0))})   "
+                               f"已勾选 {len(selected)} 个   当前排序：最新上传{'新→旧' if rev else '旧→新'}")}
+        })
+
+        page.append({
+            'component': 'VRow',
+            'props': {'class': 'mb-1'},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                 'content': [self._btn("扫描分析", 'plugin/CrossSeedCleaner/scan', {}, 'primary', 'elevated')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                 'content': [self._btn(sort_label, 'plugin/CrossSeedCleaner/sort', {}, 'secondary', 'tonal')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                 'content': [self._btn(view_label, 'plugin/CrossSeedCleaner/view', {}, 'secondary', 'tonal')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                 'content': [self._btn("清空结果", 'plugin/CrossSeedCleaner/clear',
+                                       {'confirm': 'yes'}, 'secondary', 'text')]},
+            ]
+        })
+        page.append({
+            'component': 'VRow',
+            'props': {'class': 'mb-2'},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                 'content': [self._btn(f"删除选中({len(selected)})", 'plugin/CrossSeedCleaner/delete_selected',
+                                       {'confirm': 'yes'}, 'error', 'elevated')]},
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                 'content': [self._btn("删除全部独苗", 'plugin/CrossSeedCleaner/delete_all',
+                                       {'confirm': 'yes'}, 'error', 'text')]},
+            ]
+        })
+
+        if not groups:
+            page.append({'component': 'VAlert',
+                         'props': {'type': 'success', 'variant': 'tonal',
+                                   'text': '当前无独苗种子：全部内容均有 2 个以上站点做种，或已全部处理/保护命中'}})
+        elif self._view_mode == "downloader":
+            # 下载器视图：跨内容组聚合，按已配置下载器分组展示
+            by_dl: Dict[str, List[dict]] = {}
+            dl_group_n: Dict[str, set] = {}
+            for g in groups:
+                for e in g.get("entries", []):
+                    dl = str(e.get("downloader", "") or "?")
+                    by_dl.setdefault(dl, []).append(e)
+                    dl_group_n.setdefault(dl, set()).add(g.get("gid", ""))
+            for dl in sorted(by_dl.keys()):
+                ents = sorted(by_dl[dl], key=lambda e: int(e.get("upload_time") or 0), reverse=rev)
+                dl_sel = sum(1 for e in ents if e.get("id", "") in selected)
+                page.append({
+                    'component': 'VRow',
+                    'props': {'class': 'pa-1 ma-0 mb-1', 'align': 'center',
+                              'style': 'background: rgba(33,150,243,0.10); border-radius: 6px;'},
+                    'content': [
+                        {'component': 'VCol', 'props': {'cols': True},
+                         'content': [{'component': 'div', 'props': {'class': 'text-subtitle-2'},
+                                      'text': f"下载器 {dl}（{len(ents)} 个种子 / {len(dl_group_n[dl])} 个独苗组 / 已勾选 {dl_sel}）"}]},
+                    ]
+                })
+                for e in ents:
+                    page.append(self._entry_row(e, selected))
+        else:
+            for g in groups:
+                entry_ids = [e.get("id") for e in g.get("entries", [])]
+                all_sel = all(e in selected for e in entry_ids)
+                g_latest = _g_latest(g)
+                ents = sorted(g.get("entries", []),
+                              key=lambda e: int(e.get("upload_time") or 0), reverse=rev)
+                page.append({
+                    'component': 'VCard',
+                    'props': {'variant': 'outlined', 'class': 'mb-1', 'density': 'compact'},
+                    'content': [
+                        {
+                            'component': 'VRow',
+                            'props': {'class': 'pa-1 ma-0', 'align': 'center'},
+                            'content': [
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VCheckboxBtn', 'props': {'model-value': all_sel, 'density': 'compact'},
+                                              'events': {'click': {'api': 'plugin/CrossSeedCleaner/toggle_group',
+                                                                   'method': 'get',
+                                                                   'params': {'apikey': settings.API_TOKEN,
+                                                                              'gid': g.get('gid', '')}}}}]},
+                                {'component': 'VCol', 'props': {'cols': True},
+                                 'content': [{'component': 'div', 'props': {'class': 'text-subtitle-2'},
+                                              'text': str(g.get("name", ""))[:80]}]},
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'info', 'variant': 'tonal', 'class': 'mr-1'},
+                                              'text': str(g.get("site_name", "") or "未知站点")}]},
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'orange', 'variant': 'tonal', 'class': 'mr-1'},
+                                              'text': f"{len(g.get('entries', []))}种子"}]},
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VChip', 'props': {'size': 'x-small', 'color': 'deep-purple', 'variant': 'tonal'},
+                                              'text': self._fmt_size(g.get("size", 0))}]},
+                                {'component': 'VCol', 'props': {'cols': 'auto'},
+                                 'content': [{'component': 'VChip',
+                                              'props': {'size': 'x-small', 'color': 'teal', 'variant': 'tonal'},
+                                              'text': (f"最新上传 {self._fmt_date(g_latest)}" if g_latest else "从未上传")}]},
+                            ]
+                        },
+                        *[self._entry_row(e, selected) for e in ents],
+                    ]
+                })
+
+        # 回收站
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            rec = {}
+        recycle_items = list(rec.items())
+        page.append({'component': 'div', 'props': {'class': 'text-subtitle-1 mt-3 mb-1'},
+                     'text': f"删除回收站（{len(recycle_items)} 条，支持误删恢复）"})
+        for rid, it in recycle_items[:50]:
+            page.append({
+                'component': 'VRow',
+                'props': {'class': 'pa-0 ma-0', 'align': 'center', 'dense': True},
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': True},
+                     'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                                  'text': f"[{it.get('deleted_at', '')}] {str(it.get('name', ''))[:60]} "
+                                          f"({'已删数据' if it.get('deleted_file') else '仅删任务'} / {it.get('site', '')})"}]},
+                    {'component': 'VCol', 'props': {'cols': 'auto'},
+                     'content': [self._btn("恢复", 'plugin/CrossSeedCleaner/restore',
+                                           {'id': rid}, 'primary', 'text')]},
+                    {'component': 'VCol', 'props': {'cols': 'auto'},
+                     'content': [self._btn("清除", 'plugin/CrossSeedCleaner/recycle_delete',
+                                           {'id': rid}, 'error', 'text')]},
+                ]
+            })
+        if recycle_items:
+            page.append(self._btn("清空回收站", 'plugin/CrossSeedCleaner/recycle_clear',
+                                  {'confirm': 'yes'}, 'secondary', 'text'))
+        else:
+            page.append({'component': 'div', 'props': {'class': 'text-caption text-disabled'}, 'text': '回收站为空'})
+
+        return page
+
+    # ==================== 工具 ====================
+
+    @staticmethod
+    def _file_tag(data_id: str, name: str = "") -> str:
+        """条目文件级小标签：取数据路径尾段（如单集种子的 S01E05.mkv）。
+        整季种子（路径 basename == 种子名，QB/TR content_path 指向根目录）返回空，避免与种子名重复。"""
+        import os
+        p = str(data_id or "").strip()
+        if not p:
+            return ""
+        base = os.path.basename(p.rstrip("/").rstrip("\\"))
+        if not base:
+            return ""
+        if base == str(name or "").strip():
+            return ""
+        return base[:44]
+
+    def _entry_row(self, e: dict, selected: set) -> Dict:
+        """单条种子条目行（组视图/下载器视图共用）：下载器_名称 + 文件标签 + 站点 + 已传 + 最新上传"""
+        ftag = self._file_tag(e.get("data_id", ""), e.get("name", ""))
+        return {
+            'component': 'VRow',
+            'props': {'class': 'pa-0 ma-0 ml-4', 'align': 'center', 'dense': True,
+                      'style': (('background: rgba(76,175,80,0.12); border-radius: 6px;')
+                                if (e.get("id", "") in selected) else '')},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VCheckboxBtn', 'props': {'model-value': (e.get("id", "") in selected), 'density': 'compact'},
+                              'events': {'click': {'api': 'plugin/CrossSeedCleaner/toggle',
+                                                   'method': 'get',
+                                                   'params': {'apikey': settings.API_TOKEN,
+                                                              'id': e.get("id", "")}}}}]},
+                {'component': 'VCol', 'props': {'cols': True},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': f"[{e.get('downloader', '')}] {str(e.get('name', ''))[:70]}"}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VChip',
+                              'props': {'size': 'x-small', 'color': 'brown', 'variant': 'tonal', 'class': 'mr-1'},
+                              'text': ftag}] if ftag else []},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'VChip',
+                              'props': {'size': 'x-small', 'color': 'cyan', 'variant': 'tonal', 'class': 'mr-1'},
+                              'text': str(e.get('site_name', '') or '')[:12]}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': (f"已传 {self._fmt_size(e.get('uploaded', 0))}"
+                                       if e.get('uploaded') else '')}]},
+                {'component': 'VCol', 'props': {'cols': 'auto'},
+                 'content': [{'component': 'div', 'props': {'class': 'text-caption'},
+                              'text': (f"最新上传 {self._fmt_date(e.get('upload_time', 0))}"
+                                       if e.get('upload_time') else '')}]},
+            ]
+        }
+
+    @staticmethod
+    def _btn(text: str, api: str, payload: dict, color: str, variant: str = "tonal") -> Dict:
+        params = dict(payload)
+        params['apikey'] = settings.API_TOKEN
+        return {
+            "component": "VBtn",
+            "props": {"color": color, "variant": variant, "size": "small", "block": True},
+            "text": text,
+            "events": {"click": {"api": api, "method": "get", "params": params}},
+        }
+
+    @staticmethod
+    def _fmt_size(size) -> str:
+        try:
+            size = float(size or 0)
+            if size >= 1024 ** 4:
+                return f"{size / 1024 ** 4:.2f} TB"
+            if size >= 1024 ** 3:
+                return f"{size / 1024 ** 3:.2f} GB"
+            if size >= 1024 ** 2:
+                return f"{size / 1024 ** 2:.1f} MB"
+            return f"{size / 1024:.0f} KB"
+        except Exception:
+            return "0 KB"
+
+    @staticmethod
+    def _transfer_stats_text(t_stats: Dict[str, int]) -> str:
+        """整理联动统计 -> 通知文本片段"""
+        if not t_stats:
+            return ""
+        records = t_stats.get("records", 0)
+        files = t_stats.get("files", 0)
+        skipped = t_stats.get("skipped", 0)
+        if not records and not files:
+            return ""
+        part = f"，整理联动：清转移记录 {records} 条/删媒体文件 {files} 个"
+        if skipped:
+            part += f"（{skipped} 个文件因共享引用或仍有硬链接未删，仅清记录）"
+        return part
+
+    @staticmethod
+    def _fmt_date(ts) -> str:
+        """Unix 秒级时间戳 -> YYYY-MM-DD（0/空则返回空串）"""
+        try:
+            ts = float(ts or 0)
+            if ts <= 0:
+                return ""
+            return datetime.fromtimestamp(ts, tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _qb_ts(v) -> int:
+        """qBittorrent last_activity 归一化为 Unix 秒时间戳：
+        qB 该字段存在两种语义——大值(>1e9)为时间戳直接用；小值为「距今秒数」需用 now 减去。"""
+        try:
+            v = float(v or 0)
+        except Exception:
+            return 0
+        if v <= 0:
+            return 0
+        if v > 1000000000:
+            return int(v)
+        return int(time.time() - v)
+
+    @staticmethod
+    def _fmt_site_stats(site_stats: Dict[str, Dict[str, int]]) -> str:
+        """站点维度删除统计 -> 多行文本（按清理数量降序，仅删任务的数据不计释放量）"""
+        if not site_stats:
+            return "  （无）"
+        lines = []
+        for site, st in sorted(site_stats.items(), key=lambda x: -x[1].get("count", 0)):
+            cnt = st.get("count", 0)
+            freed = st.get("freed", 0) or 0
+            tonly = st.get("torrent_only", 0) or 0
+            if freed:
+                part = f"{site}: {cnt} 个种子，释放 {CrossSeedCleaner._fmt_size(freed)}"
+                if tonly:
+                    part += f"（另 {tonly} 个仅删任务）"
+            else:
+                part = f"{site}: {cnt} 个种子（仅删任务，数据被辅种引用保留）"
+            lines.append(f"  ▶ {part}")
+        return "\n".join(lines)
+
+    def site_display(self, key: str) -> str:
+        """站点主域 key -> 展示名（MP 站点管理优先，全域名/主域双向后缀匹配，再回退内置表）"""
+        if not key:
+            return ""
+        m = self._site_name_map()
+        if key in m:
+            return m[key]
+        for d, n in m.items():
+            if d == key or d.endswith("." + key) or key.endswith("." + d):
+                return n
+        if key in self.BUILTIN_SITE_MAP:
+            return self.BUILTIN_SITE_MAP[key]
+        return key
+
+    def _site_name_map(self) -> Dict[str, str]:
+        """MoviePilot 站点表域名->站点名（缓存）"""
+        if self._site_map_cache is not None:
+            return self._site_map_cache
+        m = {}
+        try:
+            from app.db.oper.site import SiteOper
+            for site in (SiteOper().list() or []):
+                name = str(getattr(site, "name", "") or "").strip()
+                domain = str(getattr(site, "domain", "") or "").strip().lower()
+                if name and domain:
+                    h = host_of(domain) if "://" in domain else domain.split("/")[0]
+                    if h:
+                        m[h] = name
+                        parts = [p for p in h.split(".") if p]
+                        if len(parts) >= 2:
+                            # 同时注册主域 key（tracker 侧取的是主域），确保能直接命中
+                            m.setdefault(parts[-2] + "." + parts[-1], name)
+        except Exception as e:
+            logger.warning(f"跨站独苗种子清理：读取站点列表失败：{e}")
+        self._site_map_cache = m
+        return m
+
+    def _protected_site_list(self) -> List[str]:
+        """保护站点配置（兼容多选下拉的 list 与逗号分隔字符串，保留原大写）"""
+        v = self._protected_sites
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return [s.strip() for s in str(v or "").replace("，", ",").split(",") if s.strip()]
+
+    def _keyword_list(self) -> List[str]:
+        return [k.strip() for k in (self._protected_keywords or "").splitlines() if k.strip()]
+
+    def _upload_protected(self, entries: List[Dict]) -> bool:
+        """
+        累计上传量保护（阈值 0 同样是有效判定依据，不作关闭开关）：
+        - 阈值 > 0：组内累计上传 ≥ 阈值(GB) → 整组保留
+        - 阈值 = 0：组内累计上传 > 0（有任意上传量）→ 整组保留，仅清理从未上传过的内容
+        """
+        total_up = sum(int(e.get("uploaded") or 0) for e in entries)
+        if self._protect_uploaded_gb > 0:
+            return total_up >= self._protect_uploaded_gb * 1024 ** 3
+        return total_up > 0
+
+    def _site_protected(self, site_keys: set) -> bool:
+        plist = self._protected_site_list()
+        if not plist or not site_keys:
+            return False
+        pset = {p.lower() for p in plist}
+        for k in site_keys:
+            disp_low = (self.site_display(k) or "").lower()
+            k_low = (k or "").lower()
+            for p in pset:
+                if p == k_low or p == k_low.split(".")[0] \
+                        or (disp_low and (p == disp_low or p in disp_low)):
+                    return True
+        return False
+
+    # ==================== 下载器遍历 ====================
+
+    def _parse_custom(self) -> List[Tuple[str, str, str, str, str]]:
+        out = []
+        for line in (self._custom_downloaders or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 3:
+                continue
+            out.append((parts[0].lower(), parts[1], parts[2],
+                        parts[3] if len(parts) > 3 else "",
+                        parts[4] if len(parts) > 4 else ""))
+        return out
+
+    @staticmethod
+    def _build_custom(dtype: str, host: str, port: str, user: str, pwd: str):
+        try:
+            if "qb" in dtype:
+                from app.modules.qbittorrent.qbittorrent import Qbittorrent
+                return Qbittorrent(host=host, port=int(port) if port else None,
+                                   username=user or None, password=pwd or None)
+            if "transmission" in dtype or dtype == "tr":
+                from app.modules.transmission.transmission import Transmission
+                return Transmission(host=host, port=int(port) if port else None,
+                                    username=user or None, password=pwd or None)
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：构建自定义下载器失败 {dtype} {host}:{port}：{e}")
+        return None
+
+    def _iter_downloaders(self):
+        try:
+            services = DownloaderHelper().get_services() or {}
+            for name, info in services.items():
+                inst = getattr(info, "instance", None)
+                dtype = str(getattr(info, "type", "") or "").lower()
+                if not inst or not dtype:
+                    continue
+                yield name, dtype, inst
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：获取 MoviePilot 下载器失败：{e}")
+        for idx, cfg in enumerate(self._parse_custom()):
+            dtype, host, port, user, pwd = cfg
+            inst = self._build_custom(dtype, host, port, user, pwd)
+            if inst:
+                yield f"custom:{idx}", dtype, inst
+
+    def _get_downloader(self, dl: str):
+        if dl and dl.startswith("custom:"):
+            try:
+                idx = int(dl.split(":")[1])
+            except Exception:
+                return None, ""
+            custom = self._parse_custom()
+            if idx >= len(custom):
+                return None, ""
+            dtype, host, port, user, pwd = custom[idx]
+            return self._build_custom(dtype, host, port, user, pwd), dtype
+        try:
+            services = DownloaderHelper().get_services() or {}
+            info = services.get(dl)
+            if info and getattr(info, "instance", None):
+                return info.instance, str(getattr(info, "type", "") or "").lower()
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：获取下载器 {dl} 失败：{e}")
+        return None, ""
+
+    # ==================== 种子抓取（TR 直连 RPC / QB 并发） ====================
+
+    def _tr_fetch_all(self, inst: Any, dl_name: str) -> Dict[str, dict]:
+        """Transmission：直接 RPC 一次获取全部种子（全部 trackers / 大小 / 上传量 / 路径）"""
+        out = {}
+        host = getattr(inst, "_host", None)
+        if not host:
+            return out
+        proto = getattr(inst, "_protocol", "http") or "http"
+        port = getattr(inst, "_port", None)
+        user = getattr(inst, "_username", "") or ""
+        pwd = getattr(inst, "_password", "") or ""
+        url = f"{proto}://{host}:{port}/transmission/rpc" if port \
+            else f"{proto}://{host}/transmission/rpc"
+        try:
+            sess = requests.Session()
+            r1 = sess.post(url, data={}, auth=(user, pwd), timeout=20)
+            sid = r1.headers.get("X-Transmission-Session-Id")
+            if not sid:
+                logger.error("跨站独苗种子清理：TR 会话握手失败（未返回 Session-Id）")
+                return out
+            r = sess.post(url, headers={"X-Transmission-Session-Id": sid}, auth=(user, pwd),
+                          json={"method": "torrent-get",
+                                "arguments": {"fields": [
+                                    "hashString", "name", "totalSize", "percentDone", "status",
+                                    "downloadDir", "contentPath", "uploadedEver",
+                                    "activityDate", "trackers", "magnetLink"]}},
+                          timeout=120)
+            for t in r.json().get("arguments", {}).get("torrents", []):
+                h = t.get("hashString")
+                if not h:
+                    continue
+                sites = sorted({site_key(tk.get("announce", "")) for tk in (t.get("trackers") or [])
+                                if isinstance(tk, dict)})
+                sites = [s for s in sites if s]
+                done = float(t.get("percentDone") or 0) >= 1
+                active = int(t.get("status", 0) or 0) in (1, 2, 3, 4) or not done
+                content = str(t.get("contentPath") or "") \
+                    or (str(t.get("downloadDir") or "").rstrip("/") + "/" + str(t.get("name") or ""))
+                out[h] = {
+                    "dl": dl_name, "dl_type": "transmission", "hash": h,
+                    "name": str(t.get("name") or ""),
+                    "size": int(t.get("totalSize") or 0),
+                    "uploaded": int(t.get("uploadedEver") or 0),
+                    "upload_time": int(t.get("activityDate") or 0),
+                    "sites": sites,
+                    "active": active,
+                    "magnet": str(t.get("magnetLink") or ""),
+                    "save_path": str(t.get("downloadDir") or ""),
+                    "data_id": content,
+                }
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：TR RPC 拉取种子失败：{e}")
+        return out
+
+    def _qb_fetch_all(self, inst: Any, dl_name: str) -> Dict[str, dict]:
+        """qBittorrent：torrents_info + 并发取 trackers（过滤 DHT/PEX/LSD 伪 tracker，带重试回退）"""
+        out = {}
+        qbc = getattr(inst, "qbc", None)
+        if not qbc:
+            return out
+        try:
+            infos = list(qbc.torrents_info() or [])
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：QB 拉取种子列表失败：{e}")
+            return out
+
+        def _trackers(h: str) -> List[str]:
+            for attempt in range(2):
+                try:
+                    trs = qbc.torrents_trackers(torrent_hash=h) or []
+                    return [str(x.get("url") or "") for x in trs
+                            if isinstance(x, dict) and str(x.get("url") or "").startswith(("http", "udp"))]
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(0.2)
+            return []
+
+        hashes = [str(x.get("hash") or "") for x in infos]
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(_trackers, hashes))
+
+        for x, urls in zip(infos, results):
+            h = str(x.get("hash") or "")
+            if not h:
+                continue
+            if not urls:
+                t_field = str(x.get("tracker") or "")
+                if t_field.startswith(("http", "udp")):
+                    urls = [t_field]
+            if not urls:
+                mu = str(x.get("magnet_uri") or "")
+                try:
+                    qs = parse_qs(urlparse(mu).query).get("tr") or []
+                    urls = [str(q) for q in qs]
+                except Exception:
+                    urls = []
+            sites = sorted({site_key(u) for u in urls if u})
+            sites = [s for s in sites if s]
+            state = str(x.get("state") or "")
+            active = float(x.get("progress") or 0) < 1 or state.lower() in _QB_ACTIVE_STATES
+            out[h] = {
+                "dl": dl_name, "dl_type": "qbittorrent", "hash": h,
+                "name": str(x.get("name") or ""),
+                "size": int(x.get("size") or 0),
+                "uploaded": int(x.get("total_uploaded") or x.get("uploaded") or 0),
+                "upload_time": self._qb_ts(x.get("last_activity")),
+                "sites": sites,
+                "active": active,
+                "magnet": str(x.get("magnet_uri") or ""),
+                "save_path": str(x.get("save_path") or ""),
+                "data_id": str(x.get("content_path") or "")
+                or (str(x.get("save_path") or "").rstrip("/") + "/" + str(x.get("name") or "")),
+            }
+        return out
+
+    # ==================== 扫描分析 ====================
+
+    def _scan_all(self) -> Tuple[Dict[str, dict], Dict]:
+        """扫描全部下载器并做独苗分析，返回 (全量种子, 分析结果)"""
+        items: Dict[str, dict] = {}
+        for name, dtype, inst in self._iter_downloaders():
+            try:
+                if "transmission" in dtype:
+                    d = self._tr_fetch_all(inst, name)
+                elif "qb" in dtype:
+                    d = self._qb_fetch_all(inst, name)
+                else:
+                    d = {}
+                logger.info(f"跨站独苗种子清理：下载器 {name}（{dtype}）共抓取 {len(d)} 个种子")
+                for h, it in d.items():
+                    if h in items:
+                        k = f"{h}@{name}"
+                        items[k] = dict(it, hash=k)
+                    else:
+                        items[h] = it
+            except Exception as e:
+                logger.error(f"跨站独苗种子清理：下载器 {name} 处理异常：{e}")
+
+        analyzed = analyze_items(items, self._group_by)
+        groups = analyzed["groups"]
+
+        del_groups: List[dict] = []
+        protected_n = 0
+        for gk in analyzed["single"]:
+            g = groups[gk]
+            entries = g["entries"]
+            site_keys = set(g["sites"])
+            gname = g.get("name") or ""
+            if self._skip_active and any(e.get("active") for e in entries):
+                protected_n += 1
+                continue
+            if self._site_protected(site_keys):
+                protected_n += 1
+                continue
+            kws = self._keyword_list()
+            if kws and any(k.lower() in gname.lower() for k in kws):
+                protected_n += 1
+                continue
+            if self._upload_protected(entries):
+                protected_n += 1
+                continue
+            first_site = (list(site_keys) or [""])[0]
+            site_disp = self.site_display(first_site) if first_site else "未知站点"
+            del_groups.append({
+                "gid": hashlib.sha1(gk.encode("utf-8", "ignore")).hexdigest()[:12],
+                "name": gname,
+                "site": first_site,
+                "site_name": site_disp,
+                "size": max([int(e.get("size") or 0) for e in entries] or [0]),
+                "path": g.get("path", ""),
+                "entries": [{"id": f"{e['dl']}|{e['hash']}",
+                             "downloader": e["dl"], "dl_type": e.get("dl_type", ""),
+                             "hash": e["hash"], "name": e.get("name", ""),
+                             "size": int(e.get("size") or 0),
+                             "uploaded": int(e.get("uploaded") or 0),
+                             "upload_time": int(e.get("upload_time") or 0),
+                             "site": first_site, "site_name": site_disp,
+                             "magnet": e.get("magnet", ""),
+                             "save_path": e.get("save_path", ""),
+                             "data_id": e.get("data_id", "")} for e in entries],
+            })
+
+        del_seeds = sum(len(g["entries"]) for g in del_groups)
+        del_size = sum(int(g["size"] or 0) for g in del_groups)
+        site_stat: Dict[str, int] = {}
+        for g in del_groups:
+            site_stat[g["site_name"]] = site_stat.get(g["site_name"], 0) + len(g["entries"])
+        result = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "groups": del_groups,
+            "stat": {
+                "total": len(items),
+                "keep_groups": len(analyzed["keep"]),
+                "del_groups": len(del_groups),
+                "del_seeds": del_seeds,
+                "del_size": del_size,
+                "protected": protected_n,
+                "site_stat": site_stat,
+            },
+        }
+        return items, result
+
+    def _schedule_scan(self):
+        rec_stats = self._clean_recycle()  # v1.9：回收站过期备份自动清理
+        rec_line = self._recycle_line(rec_stats)
+        items, result = self._scan_all()
+        self.save_data("result", result)
+        stat = result.get("stat") or {}
+        logger.info(f"跨站独苗种子清理：分析完成 种子{stat.get('total', 0)} 多站保留组{stat.get('keep_groups', 0)} "
+                    f"独苗组{stat.get('del_groups', 0)}（涉及{stat.get('del_seeds', 0)}种子）保护命中{stat.get('protected', 0)}")
+        if self._auto_delete and result.get("groups"):
+            entries = [e for g in result["groups"] for e in g["entries"]]
+            ok, kept, site_stats, t_stats = self._delete_entries(entries)
+            total_freed = sum(s.get("freed", 0) for s in site_stats.values())
+            logger.info(f"跨站独苗种子清理：自动清理完成 成功 {ok}/{len(entries)}，数据保留 {len(kept)} 条")
+            if self._notify:
+                text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-自动清理 {ok}/{len(entries)} 个种子"
+                        f"（释放约 {self._fmt_size(total_freed)}）"
+                        + self._transfer_stats_text(t_stats)
+                        + (f"，{len(kept)} 条数据因辅种引用仅删任务" if kept else "")
+                        + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
+                if rec_line:
+                    text += "\n" + rec_line
+                self._send_notification(text)
+        elif self._notify and result.get("groups"):
+            site_stat = stat.get("site_stat") or {}
+            site_line = " / ".join(f"{k}:{v}" for k, v in
+                                   sorted(site_stat.items(), key=lambda x: -x[1])[:8])
+            text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-发现 {stat.get('del_groups', 0)} 组独苗"
+                    f"（{stat.get('del_seeds', 0)} 个种子 / {self._fmt_size(stat.get('del_size', 0))}）\n"
+                    f"多站保留 {stat.get('keep_groups', 0)} 组，保护命中 {stat.get('protected', 0)} 组\n"
+                    f"站点分布：{site_line or '-'}\n请到插件页面查看并删除")
+            if rec_line:
+                text += "\n" + rec_line
+            self._send_notification(text)
+        elif self._notify and rec_line:
+            self._send_notification(f"{self._notify_title_prefix}: 跨站独苗种子清理-回收站维护\n" + rec_line)
+
+    def scan_api(self) -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        logger.info("跨站独苗种子清理：开始扫描分析...")
+        rec_stats = self._clean_recycle()  # v1.9：手动扫描同样顺带清理回收站过期备份
+        items, result = self._scan_all()
+        self.save_data("result", result)
+        self._sel = []
+        stat = result.get("stat") or {}
+        logger.info(f"跨站独苗种子清理：扫描完成 {stat}")
+        if self._notify and (result.get("groups") or (rec_stats and rec_stats.get("removed"))):
+            text = (f"{self._notify_title_prefix}: 跨站独苗种子清理-扫描完成，"
+                    f"独苗 {stat.get('del_groups', 0)} 组 {stat.get('del_seeds', 0)} 个种子，请到插件页面查看")
+            rec_line = self._recycle_line(rec_stats)
+            if rec_line:
+                text += "\n" + rec_line
+            self._send_notification(text)
+        return {"success": True, "stat": stat}
+
+    # ==================== 勾选 ====================
+
+    def toggle_api(self, id: str) -> Dict[str, Any]:
+        if not id:
+            return {"success": False, "message": "未指定条目"}
+        selected = self._sel
+        if id in selected:
+            selected.remove(id)
+            msg = "已取消勾选"
+        else:
+            selected.append(id)
+            msg = "已勾选"
+        self._sel = selected
+        return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def toggle_group_api(self, gid: str) -> Dict[str, Any]:
+        if not gid:
+            return {"success": False, "message": "未指定组"}
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        g = next((x for x in groups if x.get("gid") == gid), None)
+        if not g:
+            return {"success": False, "message": "组不存在，请重新扫描"}
+        ids = [e.get("id") for e in g.get("entries", [])]
+        selected = self._sel
+        id_set = set(ids)
+        if all(i in selected for i in ids):
+            selected = [p for p in selected if p not in id_set]
+            msg = f"已取消勾选 {len(ids)} 项"
+        else:
+            for i in ids:
+                if i not in selected:
+                    selected.append(i)
+            msg = f"已勾选 {len(ids)} 项"
+        self._sel = selected
+        return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def toggle_all_api(self) -> Dict[str, Any]:
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        ids = [e.get("id") for g in groups for e in g.get("entries", [])]
+        if not ids:
+            return {"success": False, "message": "当前无结果"}
+        selected = self._sel
+        id_set = set(ids)
+        if all(i in selected for i in ids):
+            selected = [p for p in selected if p not in id_set]
+            msg = f"已取消勾选全部 {len(ids)} 项"
+        else:
+            selected = list(dict.fromkeys(ids))
+            msg = f"已勾选全部 {len(ids)} 项"
+        self._sel = selected
+        return {"success": True, "message": msg, "selected_count": len(selected)}
+
+    def sort_api(self) -> Dict[str, Any]:
+        """切换结果排序：按最新上传时间 旧→新 / 新→旧（从未上传记录为最冷，旧→新时排最前）"""
+        self._sort_order = "desc" if self._sort_order != "desc" else "asc"
+        label = "新→旧" if self._sort_order == "desc" else "旧→新"
+        return {"success": True, "message": f"已切换排序：最新上传 {label}"}
+
+    def view_api(self) -> Dict[str, Any]:
+        """切换结果视图：内容组（按种子名聚合）/ 下载器（按已配置下载器分组）"""
+        self._view_mode = "downloader" if self._view_mode != "downloader" else "group"
+        label = "按下载器" if self._view_mode == "downloader" else "按内容组"
+        return {"success": True, "message": f"已切换视图：{label}"}
+
+    # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
+
+    def _delete_entries(self, entries: List[Dict]) -> Tuple[int, List[str], Dict[str, Dict[str, int]], Dict[str, int]]:
+        """
+        按下载器分组删除；删除数据文件前检查数据是否被「本次删除范围之外」的种子引用，
+        被引用则该种子降级为仅删任务；删数据的种子同步清理媒体库硬链接与转移记录。
+        返回 (成功数, 数据保留提示列表, 站点维度统计, 整理联动统计 {records/files/skipped})
+        """
+        by_dl: Dict[str, List[Dict]] = {}
+        for e in entries:
+            dl = e.get("downloader")
+            if dl:
+                by_dl.setdefault(dl, []).append(e)
+        ok = 0
+        kept: List[str] = []
+        site_stats: Dict[str, Dict[str, int]] = {}
+        del_data_hashes: List[str] = []
+        del_ids = {e.get("id") for e in entries}
+        for dl, items in by_dl.items():
+            inst, dtype = self._get_downloader(dl)
+            if not inst:
+                logger.error(f"跨站独苗种子清理：下载器 {dl} 不可用，跳过")
+                continue
+            # 重新拉取全量种子（组外引用判断 + 存在性校验）
+            try:
+                if "transmission" in (dtype or ""):
+                    all_ids = {h: it.get("data_id") or "" for h, it in self._tr_fetch_all(inst, dl).items()}
+                elif "qb" in (dtype or ""):
+                    all_ids = {h: it.get("data_id") or "" for h, it in self._qb_fetch_all(inst, dl).items()}
+                else:
+                    all_ids = {}
+            except Exception as e:
+                logger.error(f"跨站独苗种子清理：获取 {dl} 全量种子失败，跳过该下载器：{e}")
+                continue
+            # 本下载器中本次要删的 hash 集合（用于排除组内互引）
+            del_hashes = {(e.get("hash") or "").split("@")[0] for e in entries if e.get("downloader") == dl}
+            groups: Dict[bool, List[str]] = {False: [], True: []}
+            entry_meta: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                h = it.get("hash") or ""
+                h_plain = h.split("@")[0]
+                if h_plain not in all_ids:
+                    logger.warning(f"跨站独苗种子清理：种子 {h_plain} 已不在下载器 {dl}，跳过")
+                    continue
+                meta_sname = it.get("site_name") or it.get("site") or "未知站点"
+                data_id = all_ids.get(h_plain) or ""
+                referenced = False
+                if self._delete_file:
+                    for oh, od in all_ids.items():
+                        oh_plain = oh.split("@")[0]
+                        if oh_plain == h_plain or oh_plain in del_hashes:
+                            continue
+                        if od and data_id and od == data_id:
+                            referenced = True
+                            break
+                if referenced:
+                    kept.append(it.get("name") or h_plain)
+                    groups[False].append(h_plain)
+                    entry_meta[h_plain] = {"site_name": meta_sname, "size": 0}
+                else:
+                    groups[bool(self._delete_file)].append(h_plain)
+                    entry_meta[h_plain] = {"site_name": meta_sname, "size": int(it.get("size") or 0)}
+            for delete_file, hashes in groups.items():
+                if not hashes:
+                    continue
+                self._backup_entries(dl, dtype, inst, items, delete_file, set(hashes))
+                try:
+                    if inst.delete_torrents(delete_file=delete_file, ids=hashes):
+                        ok += len(hashes)
+                        if delete_file:
+                            del_data_hashes.extend(hashes)
+                        # 站点维度统计（成功删除的才计入）
+                        for hh in hashes:
+                            meta = entry_meta.get(hh) or {}
+                            sname = meta.get("site_name") or "未知站点"
+                            st = site_stats.setdefault(sname, {"count": 0, "freed": 0, "torrent_only": 0})
+                            st["count"] += 1
+                            if delete_file:
+                                st["freed"] += int(meta.get("size") or 0)
+                            else:
+                                st["torrent_only"] += 1
+                    else:
+                        logger.error(f"跨站独苗种子清理：{dl} 删除失败（delete_file={delete_file}）")
+                except Exception as e:
+                    logger.error(f"跨站独苗种子清理：{dl} 删除种子异常：{e}")
+        # 更新结果缓存
+        try:
+            saved = self.get_data("result") or {}
+            groups = saved.get("groups") or []
+            for g in groups:
+                g["entries"] = [e for e in g.get("entries", []) if e.get("id") not in del_ids]
+            saved["groups"] = [g for g in groups if g.get("entries")]
+            stat = saved.get("stat") or {}
+            stat["del_seeds"] = sum(len(g["entries"]) for g in saved["groups"])
+            stat["del_groups"] = len(saved["groups"])
+            saved["stat"] = stat
+            self.save_data("result", saved)
+        except Exception as e:
+            logger.warning(f"跨站独苗种子清理：更新结果缓存失败：{e}")
+        self._sel = [s for s in self._sel if s not in del_ids]
+        # 整理联动：删了数据的种子同步清理媒体库硬链接文件与转移记录
+        t_stats = self._clean_transfer_records(del_data_hashes) if del_data_hashes else {}
+        if t_stats:
+            logger.info(f"跨站独苗种子清理：整理联动完成 转移记录 {t_stats.get('records', 0)} 条 / "
+                        f"媒体文件 {t_stats.get('files', 0)} 个 / 共享跳过 {t_stats.get('skipped', 0)} 个")
+        return ok, kept, site_stats, t_stats
+
+    # ==================== 整理联动（媒体库硬链接 + 转移记录） ====================
+
+    def _clean_transfer_records(self, del_hashes: List[str]) -> Dict[str, int]:
+        """
+        对已删除数据文件的种子，同步清理 MoviePilot 整理产生的媒体库硬链接文件与转移记录。
+        匹配：transferhistory.download_hash == 下载器种子 hash（精确）。
+        删媒体文件的双重保护：
+        1. 共享引用保护：该目标文件还有本次删除范围之外的转移记录指向（其他来源也整理到此文件）→ 只删记录不删文件；
+        2. 链接数保护：硬链接 nlink > 1（下载器侧仍有源文件链接或其他硬链）→ 只删记录不删文件；
+        外部存储（dest_storage 非 local）：不动文件只删记录。
+        返回 {records: 删记录数, files: 删文件数, skipped: 文件被保护跳过数}
+        """
+        stats = {"records": 0, "files": 0, "skipped": 0}
+        if not self._clean_media_links or not del_hashes:
+            return stats
+        import os
+        try:
+            from app.db.oper.transferhistory import TransferHistoryOper
+            from app.schemas.query import TransferHistoryFilter, QueryPageRequest
+        except Exception as e:
+            logger.warning(f"跨站独苗种子清理：整理联动不可用（数据库模块导入失败）：{e}")
+            return stats
+        try:
+            oper = TransferHistoryOper()
+            all_rows: List[Any] = []
+            page_no = 1
+            while True:
+                rows, total = oper.query(TransferHistoryFilter(), QueryPageRequest(page=page_no, count=200))
+                all_rows.extend(rows or [])
+                if not rows or len(all_rows) >= (total or 0):
+                    break
+                page_no += 1
+                if page_no > 50:
+                    break
+            by_hash: Dict[str, List[Any]] = {}
+            dest_refs: Dict[str, set] = {}
+            for r in all_rows:
+                dh = (getattr(r, "download_hash", "") or "").lower()
+                if dh:
+                    by_hash.setdefault(dh, []).append(r)
+                dest = getattr(r, "dest", "") or ""
+                if dest and dh:
+                    dest_refs.setdefault(dest, set()).add(dh)
+            del_set = {h.split("@")[0].lower() for h in del_hashes}
+            # 本次要删的转移记录（按 hash 精确命中）
+            touched: Dict[int, Any] = {}
+            for h in del_set:
+                for r in by_hash.get(h, []):
+                    touched[r.id] = r
+            if not touched:
+                logger.info("跨站独苗种子清理：整理联动未命中任何转移记录（种子未经 MoviePilot 整理或不匹配）")
+                return stats
+            for rid, r in touched.items():
+                dest = getattr(r, "dest", "") or ""
+                dest_storage = str(getattr(r, "dest_storage", "") or "").lower()
+                can_del_file = False
+                if dest and dest_storage in ("", "local"):
+                    other_refs = dest_refs.get(dest, set()) - del_set
+                    if not other_refs:
+                        try:
+                            st = os.stat(dest)
+                            can_del_file = st.st_nlink <= 1  # 硬链接已无其他引用
+                        except FileNotFoundError:
+                            pass  # 文件本身已不存在（move 模式/已手动删），仅删记录
+                        except Exception:
+                            can_del_file = False
+                    if can_del_file:
+                        try:
+                            os.remove(dest)
+                            stats["files"] += 1
+                            self._prune_empty_dirs(os.path.dirname(dest))
+                        except Exception as e:
+                            logger.warning(f"跨站独苗清理：删除媒体文件失败 {dest}：{e}")
+                    elif os.path.exists(dest):
+                        stats["skipped"] += 1
+                try:
+                    oper.delete(rid)
+                    stats["records"] += 1
+                except Exception as e:
+                    logger.warning(f"跨站独苗清理：删除转移记录 #{rid} 失败：{e}")
+        except Exception as e:
+            logger.error(f"跨站独苗种子清理：整理联动执行异常：{e}")
+        return stats
+
+    @staticmethod
+    def _prune_empty_dirs(path: str, max_up: int = 4):
+        """删除媒体文件后向上清理连续空目录（最多 max_up 层，遇非空/异常即停）"""
+        import os
+        p = str(path or "").rstrip("/")
+        for _ in range(max_up):
+            if not p or p == "/" or len(p) < 6:
+                return
+            try:
+                if os.path.isdir(p) and not os.listdir(p):
+                    os.rmdir(p)
+                else:
+                    return
+            except Exception:
+                return
+            p = os.path.dirname(p)
+
+    # ==================== 回收站（误删恢复） ====================
+
+    @staticmethod
+    def _recycle_dir() -> str:
+        import os
+        try:
+            base = settings.PLUGIN_DATA_PATH
+        except Exception:
+            base = "/config/plugins"
+        d = os.path.join(str(base), "crossseed_recycle")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _safe_name(s: str) -> str:
+        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s or ""))
+
+    def _backup_entries(self, dl: str, dtype: str, inst: Any, items: List[Dict],
+                        delete_file: bool, hash_set: set):
+        if not self._recycle_enabled:
+            return
+        import os
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            rec = {}
+        dirty = False
+        for it in items:
+            h_plain = (it.get("hash") or "").split("@")[0]
+            if not h_plain or h_plain not in hash_set:
+                continue
+            key = it.get("id") or f"{dl}|{h_plain}"
+            if key in rec:
+                continue
+            bk_type, bk_file, bk_magnet = "", "", ""
+            if "qb" in (dtype or ""):
+                try:
+                    qbc = getattr(inst, "qbc", None)
+                    if qbc:
+                        resp = qbc.torrents_export(torrent_hash=h_plain)
+                        content = resp if isinstance(resp, bytes) else getattr(resp, "content", None)
+                        if content and content[:1] == b"d":
+                            fn = f"{self._safe_name(dl)}_{h_plain}.torrent"
+                            with open(os.path.join(self._recycle_dir(), fn), "wb") as f:
+                                f.write(content)
+                            bk_type, bk_file = "torrent", fn
+                except Exception as e:
+                    logger.warning(f"跨站独苗种子清理：导出种子文件失败（{str(it.get('name', ''))[:30]}）：{e}")
+            if not bk_type and it.get("magnet"):
+                bk_type, bk_magnet = "magnet", str(it["magnet"])
+            if not bk_type:
+                logger.warning(f"跨站独苗种子清理：该种子无可用备份材料（{str(it.get('name', ''))[:40]}）")
+                continue
+            rec[key] = {
+                "downloader": dl,
+                "dl_type": dtype or "",
+                "hash": h_plain,
+                "name": it.get("name", ""),
+                "site": it.get("site_name") or it.get("site", ""),
+                "size": it.get("size", 0) or 0,
+                "uploaded": it.get("uploaded", 0) or 0,
+                "save_path": it.get("save_path", ""),
+                "deleted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "deleted_file": bool(delete_file),
+                "bk_type": bk_type,
+                "bk_file": bk_file,
+                "bk_magnet": bk_magnet,
+            }
+            dirty = True
+        if dirty:
+            self.save_data("recycle", rec)
+
+    def _clean_recycle(self) -> Optional[Dict[str, int]]:
+        """回收站过期备份自动清理（v1.9）：删除时间超过保留天数的备份条目与 .torrent 文件。
+        保留天数 <=0 表示永不清理；备份关闭时跳过。
+        返回 {"removed": 清理条数, "torrent_files": 删除的种子文件数, "remaining": 剩余条数}，未启用返回 None"""
+        if not self._recycle_enabled or self._recycle_retention_days <= 0:
+            return None
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            return None
+        if not rec:
+            return {"removed": 0, "torrent_files": 0, "remaining": 0}
+        now = datetime.now()
+        cutoff = now - timedelta(days=self._recycle_retention_days)
+        removed = 0
+        torrent_files = 0
+        rdir = None
+        for key in list(rec.keys()):
+            info = rec.get(key) or {}
+            try:
+                deleted_at = datetime.strptime(str(info.get("deleted_at") or ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue  # 无删除时间无法解析则保守保留
+            if deleted_at >= cutoff:
+                continue
+            if info.get("bk_type") == "torrent" and info.get("bk_file"):
+                try:
+                    if rdir is None:
+                        rdir = self._recycle_dir()
+                    fp = os.path.join(rdir, str(info["bk_file"]))
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception as e:
+                    logger.warning(f"跨站独苗种子清理：删除回收站备份文件失败（{info.get('bk_file')}）：{e}")
+                torrent_files += 1
+            rec.pop(key, None)
+            removed += 1
+        if removed:
+            self.save_data("recycle", rec)
+            logger.info(f"跨站独苗种子清理：回收站自动清理完成：删除过期备份 {removed} 条"
+                        f"（含 .torrent 文件 {torrent_files} 个），剩余 {len(rec)} 条，保留天数 {self._recycle_retention_days}")
+        return {"removed": removed, "torrent_files": torrent_files, "remaining": len(rec)}
+
+    def _recycle_line(self, rec_stats: Optional[Dict[str, int]]) -> str:
+        """通知用回收站维护摘要行（无清理时不显示）"""
+        if rec_stats and rec_stats.get("removed"):
+            return (f"回收站维护：清理过期备份 {rec_stats['removed']} 条"
+                    f"（保留 {self._recycle_retention_days} 天），剩余 {rec_stats['remaining']} 条")
+        return ""
+
+    def clean_recycle_api(self) -> Dict[str, Any]:
+        """手动触发回收站过期清理（API）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        stats = self._clean_recycle()
+        if stats is None:
+            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
+        return {"success": True, "removed": stats.get("removed", 0),
+                "torrent_files": stats.get("torrent_files", 0),
+                "remaining": stats.get("remaining", 0),
+                "retention_days": self._recycle_retention_days,
+                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
+                            if stats.get("removed") else "无过期备份")}
+
+    def restore_api(self, id: str = "") -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if not id:
+            return {"success": False, "message": "未指定条目"}
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            rec = {}
+        item = rec.get(id)
+        if not item:
+            return {"success": False, "message": "回收站中无此记录"}
+        inst, dtype = self._get_downloader(item.get("downloader") or "")
+        if not inst:
+            return {"success": False, "message": f"原下载器 {item.get('downloader')} 不可用"}
+        import os
+        content = None
+        if item.get("bk_type") == "torrent" and item.get("bk_file"):
+            path = os.path.join(self._recycle_dir(), item["bk_file"])
+            if not os.path.isfile(path):
+                return {"success": False, "message": "备份种子文件缺失"}
+            try:
+                with open(path, "rb") as f:
+                    content = f.read()
+            except Exception as e:
+                return {"success": False, "message": f"读取备份文件失败：{e}"}
+        elif item.get("bk_magnet"):
+            content = str(item["bk_magnet"])
+        if not content:
+            return {"success": False, "message": "无可用备份材料"}
+        try:
+            if "transmission" in (dtype or ""):
+                t = inst.add_torrent(content=content, is_paused=True,
+                                     download_dir=item.get("save_path") or None)
+                ok = t is not None
+            else:
+                ok, _ = inst.add_torrent(content=content, is_paused=True,
+                                         download_dir=item.get("save_path") or None)
+        except Exception as e:
+            return {"success": False, "message": f"添加种子失败：{e}"}
+        if not ok:
+            return {"success": False, "message": "添加种子失败（下载器返回失败）"}
+        h = item.get("hash") or ""
+        if h:
+            try:
+                inst.recheck_torrents(ids=[h])
+            except Exception:
+                pass
+            try:
+                inst.start_torrents(ids=[h])
+            except Exception:
+                pass
+        rec.pop(id, None)
+        self.save_data("recycle", rec)
+        if item.get("bk_file"):
+            try:
+                os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
+            except Exception:
+                pass
+        logger.info(f"跨站独苗种子清理：已恢复种子 {str(item.get('name', ''))[:40]}")
+        return {"success": True, "message": "恢复成功：已重新添加并校验数据"
+                + ("（原数据已删，将重新下载）" if item.get("deleted_file") else "")}
+
+    def recycle_delete_api(self, id: str = "") -> Dict[str, Any]:
+        if not id:
+            return {"success": False, "message": "未指定条目"}
+        try:
+            rec = self.get_data("recycle") or {}
+        except Exception:
+            rec = {}
+        item = rec.pop(id, None)
+        if not item:
+            return {"success": False, "message": "回收站中无此记录"}
+        self.save_data("recycle", rec)
+        if item.get("bk_file"):
+            try:
+                import os
+                os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
+            except Exception:
+                pass
+        return {"success": True, "message": "已清除该备份"}
+
+    def recycle_clear_api(self, confirm: str = "") -> Dict[str, Any]:
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        self.save_data("recycle", {})
+        try:
+            import os
+            d = self._recycle_dir()
+            for fn in os.listdir(d):
+                if fn.endswith(".torrent"):
+                    try:
+                        os.remove(os.path.join(d, fn))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {"success": True, "message": "回收站已清空"}
+
+    # ==================== 删除 API ====================
+
+    def delete_api(self, id: str, confirm: str = "") -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        target = None
+        for g in groups:
+            for e in g.get("entries", []):
+                if e.get("id") == id:
+                    target = e
+                    break
+            if target:
+                break
+        if not target:
+            return {"success": False, "message": "条目不存在，请重新扫描"}
+        ok, _, _, _ = self._delete_entries([target])
+        return {"success": ok > 0, "message": f"已删除 {ok} 个" if ok else "删除失败"}
+
+    def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        selected = self._sel
+        if not selected:
+            return {"success": False, "message": "未勾选任何条目"}
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        targets = [e for g in groups for e in g.get("entries", []) if e.get("id") in selected]
+        if not targets:
+            return {"success": False, "message": "勾选条目不在结果中，请重新扫描"}
+        ok, kept, site_stats, t_stats = self._delete_entries(targets)
+        total_freed = sum(s.get("freed", 0) for s in site_stats.values())
+        logger.info(f"跨站独苗种子清理：删除勾选完成 {ok}/{len(targets)}")
+        if self._notify and ok:
+            self._send_notification(
+                f"{self._notify_title_prefix}: 跨站独苗种子清理-删除勾选 {ok}/{len(targets)} 个种子"
+                f"（释放约 {self._fmt_size(total_freed)}）"
+                + self._transfer_stats_text(t_stats)
+                + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
+                + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
+        return {"success": True, "ok": ok, "total": len(targets)}
+
+    def delete_all_api(self, confirm: str = "") -> Dict[str, Any]:
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        saved = self.get_data("result") or {}
+        groups = saved.get("groups") or []
+        targets = [e for g in groups for e in g.get("entries", [])]
+        if not targets:
+            return {"success": False, "message": "当前无结果"}
+        ok, kept, site_stats, t_stats = self._delete_entries(targets)
+        total_freed = sum(s.get("freed", 0) for s in site_stats.values())
+        logger.info(f"跨站独苗种子清理：全部删除完成 {ok}/{len(targets)}")
+        if self._notify and ok:
+            self._send_notification(
+                f"{self._notify_title_prefix}: 跨站独苗种子清理-删除全部独苗 {ok}/{len(targets)} 个种子"
+                f"（释放约 {self._fmt_size(total_freed)}）"
+                + self._transfer_stats_text(t_stats)
+                + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
+                + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
+        return {"success": True, "ok": ok, "total": len(targets)}
+
+    def clear_api(self, confirm: str = "") -> Dict[str, Any]:
+        if confirm != "yes":
+            return {"success": False, "message": "请确认参数 confirm=yes"}
+        self.save_data("result", {"time": "", "groups": [], "stat": {}})
+        self._sel = []
+        return {"success": True}
+
+    # ==================== 通知与停止 ====================
+
+    def stop_service(self):
+        self.__stop_service()
+
+    def __stop_service(self):
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            print(str(e))
+
+    def __update_config(self):
+        self.update_config({
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "cron": self._cron,
+            "delete_file": self._delete_file,
+            "auto_delete": self._auto_delete,
+            "notify": self._notify,
+            "webhook": self._webhook,
+            "notify_title_prefix": self._notify_title_prefix,
+            "group_by": self._group_by,
+            "skip_active": self._skip_active,
+            "protected_sites": self._protected_site_list(),
+            "protected_keywords": self._protected_keywords,
+            "protect_uploaded_gb": self._protect_uploaded_gb,
+            "recycle_enabled": self._recycle_enabled,
+            "recycle_retention_days": self._recycle_retention_days,
+            "clean_media_links": self._clean_media_links,
+            "custom_downloaders": self._custom_downloaders,
+        })
+
+    def _send_notification(self, text: str):
+        if self._webhook:
+            try:
+                resp = requests.post(self._webhook,
+                                     json={"msg_type": "text", "content": {"text": text}}, timeout=15)
+                if resp.status_code == 200 and resp.json().get("code") == 0:
+                    logger.info("跨站独苗种子清理飞书通知发送成功")
+                    return
+                else:
+                    logger.error(f"跨站独苗种子清理飞书通知发送失败：{resp.text[:200]}")
+            except Exception as e:
+                logger.error(f"跨站独苗种子清理飞书通知发送异常：{e}")
+        self.post_message(title="跨站独苗种子清理", text=text)
