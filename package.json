@@ -156,5 +156,19 @@
       "v1.0.0": "首个版本：订阅 NoticeMessage 事件检测站点删除种子站内信，自动删除对应种子+数据源文件+转移记录；数据共享保护（跨站共享仅删任务）；回收站审计记录保留天数滚动清理；自动/仅记录双模式；清理后回执",
       "v1.1.0": "修复启用后「立即运行一次」把配置冲掉导致插件实际未生效的问题（onlyonce 重置改为合并写配置）；「立即运行一次」改为兜底扫描——读 message 表最近站点消息，处理插件启用前漏掉的删种消息（持久化去重防重复）；新增 /scan 手动扫描 API 与「扫描条数」配置；新增扫描按钮"
     }
+  },
+  "NextReleaseTracker": {
+    "name": "追剧助手",
+    "description": "只追你明确加入名单的剧集和电影；按设定周期均摊检查量，发现新一季或同系列下一部后提醒一次。【Finn 维护版】已适配 MoviePilot V3：事件注册移至插件主类，修复 V3 事件绑定解析器跳过 Mixin 处理器导致订阅/入库联动失效的问题。",
+    "labels": "订阅",
+    "version": "1.1.25",
+    "icon": "https://raw.githubusercontent.com/morningstar-ski/moviepilot-zhuiju-helper/main/icons/nextreleasetracker.png",
+    "author": "morningstar-ski / Finn 维护",
+    "level": 1,
+    "v2": true,
+    "v3": true,
+    "history": {
+      "v1.1.25": "Finn V3 适配版：@eventmanager.register 装饰器从 NextReleaseTrackerEventMixin 移至主类转发方法，事件处理器获得 V3 EventBindingResolver 认领；V2 宿主同样兼容（装饰器在主类不影响旧事件总线）"
+    }
   }
 }
