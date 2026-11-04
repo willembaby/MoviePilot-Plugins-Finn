@@ -39,7 +39,7 @@ class OrphanFileCleaner(_PluginBase):
                    "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
                    "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.3"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
@@ -354,6 +354,11 @@ class OrphanFileCleaner(_PluginBase):
         scan_time = saved.get("time", "")
         deleted = self.get_data("deleted") or []
         selected = self._sel
+        # 剔除不在当前扫描结果中的陈旧勾选（扫描结果变化或残留项），
+        # 防止「已勾选 N」出现没有对应条目的幻影数值
+        valid_paths = {it.get("path") for it in items}
+        selected = [p for p in selected if p in valid_paths]
+        self._sel = selected
         selected_set = set(selected)
         hl_count = sum(1 for it in items if it.get("has_hardlink"))
 
