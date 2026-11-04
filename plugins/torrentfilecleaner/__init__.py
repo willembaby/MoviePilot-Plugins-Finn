@@ -49,7 +49,7 @@ class TorrentFileCleaner(_PluginBase):
                    "并自动清理（仅删任务不删文件）。每个下载器可独立开关与配置容器路径映射，"
                    "支持全量不可达保护，飞书通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "torrentfilecleaner_"
@@ -935,21 +935,20 @@ class TorrentFileCleaner(_PluginBase):
     def scan_api(self) -> Dict[str, Any]:
         """手动扫描（v1.4：只分析不删除，结果展示到详情页）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         items, stats, skipped = self._scan_collect()
         if items is None:
-            return {"success": False, "message": "未找到已连接的下载器"}
+            return {'success': False, 'message': '未找到已连接的下载器', 'data': None}
         self._sel = []
         self._save_result(items, stats, skipped)
         logger.info(f"种子文件清理：扫描完成，发现 {len(items)} 个无数据文件种子")
         if self._notify:
             self._send_notification(self._scan_notify_text(items, stats, skipped))
-        return {"success": True, "total": len(items), "items": items,
-                "message": f"扫描完成，发现 {len(items)} 个无数据文件种子，请到插件详情页确认删除"}
+        return {'success': True, 'message': f'扫描完成，发现 {len(items)} 个无数据文件种子，请到插件详情页确认删除', 'data': {'total': len(items), 'items': items}}
 
     def toggle_api(self, id: str) -> Dict[str, Any]:
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         selected = self._sel
         if id in selected:
             selected.remove(id)
@@ -958,16 +957,16 @@ class TorrentFileCleaner(_PluginBase):
             selected.append(id)
             msg = "已勾选"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def toggle_dl_api(self, dl: str) -> Dict[str, Any]:
         """按下载器组全选/取消"""
         if not dl:
-            return {"success": False, "message": "未指定下载器"}
+            return {'success': False, 'message': '未指定下载器', 'data': None}
         saved = self.get_data("result") or {}
         ids = [it.get("id") for it in saved.get("items", []) if it.get("downloader") == dl]
         if not ids:
-            return {"success": False, "message": "该下载器无条目"}
+            return {'success': False, 'message': '该下载器无条目', 'data': None}
         selected = self._sel
         id_set = set(ids)
         if all(i in selected for i in ids):
@@ -979,20 +978,20 @@ class TorrentFileCleaner(_PluginBase):
                     selected.append(i)
             msg = f"已勾选 {len(ids)} 项"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def delete_api(self, id: str, confirm: str = "") -> Dict[str, Any]:
         """删除单条（仅删任务不删文件）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         saved = self.get_data("result") or {}
         target = next((it for it in saved.get("items", []) if it.get("id") == id), None)
         if not target:
-            return {"success": False, "message": "条目不存在，请重新扫描"}
+            return {'success': False, 'message': '条目不存在，请重新扫描', 'data': None}
         ok, deleted = self._delete_entries([target])
         if deleted:
             self._remove_from_result(deleted)
@@ -1000,22 +999,22 @@ class TorrentFileCleaner(_PluginBase):
                 self._send_notification(
                     f"{self._notify_title_prefix}: 种子文件清理-已删除 1 个种子任务\n"
                     f"  ▶ 《{target.get('name')}》 [{target.get('downloader')}/{target.get('dl_type')}]（未删文件）")
-            return {"success": True, "message": "已删除"}
-        return {"success": False, "message": "删除失败，请查看日志"}
+            return {'success': True, 'message': '已删除', 'data': None}
+        return {'success': False, 'message': '删除失败，请查看日志', 'data': None}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
         """批量删除勾选条目"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         selected = self._sel
         if not selected:
-            return {"success": False, "message": "未勾选任何条目"}
+            return {'success': False, 'message': '未勾选任何条目', 'data': None}
         saved = self.get_data("result") or {}
         targets = [it for it in saved.get("items", []) if it.get("id") in set(selected)]
         if not targets:
-            return {"success": False, "message": "勾选的条目不在结果中，请重新扫描"}
+            return {'success': False, 'message': '勾选的条目不在结果中，请重新扫描', 'data': None}
         ok, deleted = self._delete_entries(targets)
         if deleted:
             self._remove_from_result(deleted)
@@ -1024,22 +1023,22 @@ class TorrentFileCleaner(_PluginBase):
                 self._send_notification(
                     f"{self._notify_title_prefix}: 种子文件清理-已删除 {len(deleted)} 个种子任务（未删文件），"
                     f"请到插件详情页查看剩余")
-            return {"success": True, "ok": len(deleted), "message": f"已删除 {len(deleted)} 个"}
-        return {"success": False, "message": "删除失败，请查看日志"}
+            return {'success': True, 'message': f'已删除 {len(deleted)} 个', 'data': {'ok': len(deleted)}}
+        return {'success': False, 'message': '删除失败，请查看日志', 'data': None}
 
     def delete_all_api(self, dl: str = "", confirm: str = "") -> Dict[str, Any]:
         """删除全部/本下载器组条目"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         if dl:
             targets = [it for it in saved.get("items", []) if it.get("downloader") == dl]
         else:
             targets = saved.get("items", [])
         if not targets:
-            return {"success": False, "message": "当前无结果"}
+            return {'success': False, 'message': '当前无结果', 'data': None}
         ok, deleted = self._delete_entries(targets)
         if deleted:
             self._remove_from_result(deleted)
@@ -1047,15 +1046,15 @@ class TorrentFileCleaner(_PluginBase):
             if self._notify:
                 self._send_notification(
                     f"{self._notify_title_prefix}: 种子文件清理-已删除 {len(deleted)} 个种子任务（未删文件）")
-            return {"success": True, "ok": len(deleted), "total": len(targets), "message": f"已删除 {len(deleted)} 个"}
-        return {"success": False, "message": "删除失败，请查看日志"}
+            return {'success': True, 'message': f'已删除 {len(deleted)} 个', 'data': {'ok': len(deleted), 'total': len(targets)}}
+        return {'success': False, 'message': '删除失败，请查看日志', 'data': None}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("result", {"time": "", "items": [], "total": 0, "stats": [], "skipped": []})
         self._sel = []
-        return {"success": True}
+        return {'success': True, 'message': '', 'data': None}
 
     # ==================== 通知 ====================
 
