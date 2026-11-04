@@ -106,7 +106,7 @@ class CrossSeedCleaner(_PluginBase):
                    "支持未完成保护/站点白名单/关键词/上传量阈值保护、回收站备份恢复、定时与手动触发，"
                    "删除通知按站点汇总清理数量与释放空间。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "crossseedcleaner_"
@@ -1071,7 +1071,7 @@ class CrossSeedCleaner(_PluginBase):
 
     def scan_api(self) -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         logger.info("跨站独苗种子清理：开始扫描分析...")
         rec_stats = self._clean_recycle()  # v1.9：手动扫描同样顺带清理回收站过期备份
         items, result = self._scan_all()
@@ -1086,13 +1086,13 @@ class CrossSeedCleaner(_PluginBase):
             if rec_line:
                 text += "\n" + rec_line
             self._send_notification(text)
-        return {"success": True, "stat": stat}
+        return {'success': True, 'message': '', 'data': {'stat': stat}}
 
     # ==================== 勾选 ====================
 
     def toggle_api(self, id: str) -> Dict[str, Any]:
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         selected = self._sel
         if id in selected:
             selected.remove(id)
@@ -1101,16 +1101,16 @@ class CrossSeedCleaner(_PluginBase):
             selected.append(id)
             msg = "已勾选"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def toggle_group_api(self, gid: str) -> Dict[str, Any]:
         if not gid:
-            return {"success": False, "message": "未指定组"}
+            return {'success': False, 'message': '未指定组', 'data': None}
         saved = self.get_data("result") or {}
         groups = saved.get("groups") or []
         g = next((x for x in groups if x.get("gid") == gid), None)
         if not g:
-            return {"success": False, "message": "组不存在，请重新扫描"}
+            return {'success': False, 'message': '组不存在，请重新扫描', 'data': None}
         ids = [e.get("id") for e in g.get("entries", [])]
         selected = self._sel
         id_set = set(ids)
@@ -1123,14 +1123,14 @@ class CrossSeedCleaner(_PluginBase):
                     selected.append(i)
             msg = f"已勾选 {len(ids)} 项"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def toggle_all_api(self) -> Dict[str, Any]:
         saved = self.get_data("result") or {}
         groups = saved.get("groups") or []
         ids = [e.get("id") for g in groups for e in g.get("entries", [])]
         if not ids:
-            return {"success": False, "message": "当前无结果"}
+            return {'success': False, 'message': '当前无结果', 'data': None}
         selected = self._sel
         id_set = set(ids)
         if all(i in selected for i in ids):
@@ -1140,19 +1140,19 @@ class CrossSeedCleaner(_PluginBase):
             selected = list(dict.fromkeys(ids))
             msg = f"已勾选全部 {len(ids)} 项"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def sort_api(self) -> Dict[str, Any]:
         """切换结果排序：按最新上传时间 旧→新 / 新→旧（从未上传记录为最冷，旧→新时排最前）"""
         self._sort_order = "desc" if self._sort_order != "desc" else "asc"
         label = "新→旧" if self._sort_order == "desc" else "旧→新"
-        return {"success": True, "message": f"已切换排序：最新上传 {label}"}
+        return {'success': True, 'message': f'已切换排序：最新上传 {label}', 'data': None}
 
     def view_api(self) -> Dict[str, Any]:
         """切换结果视图：内容组（按种子名聚合）/ 下载器（按已配置下载器分组）"""
         self._view_mode = "downloader" if self._view_mode != "downloader" else "group"
         label = "按下载器" if self._view_mode == "downloader" else "按内容组"
-        return {"success": True, "message": f"已切换视图：{label}"}
+        return {'success': True, 'message': f'已切换视图：{label}', 'data': None}
 
     # ==================== 删除（带组外辅种保护 + 回收站备份） ====================
 
@@ -1487,47 +1487,42 @@ class CrossSeedCleaner(_PluginBase):
     def clean_recycle_api(self) -> Dict[str, Any]:
         """手动触发回收站过期清理（API）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         stats = self._clean_recycle()
         if stats is None:
-            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
-        return {"success": True, "removed": stats.get("removed", 0),
-                "torrent_files": stats.get("torrent_files", 0),
-                "remaining": stats.get("remaining", 0),
-                "retention_days": self._recycle_retention_days,
-                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
-                            if stats.get("removed") else "无过期备份")}
+            return {'success': False, 'message': '回收站未启用或保留天数为 0（永不清理）', 'data': None}
+        return {'success': True, 'message': f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条" if stats.get('removed') else '无过期备份', 'data': {'removed': stats.get('removed', 0), 'torrent_files': stats.get('torrent_files', 0), 'remaining': stats.get('remaining', 0), 'retention_days': self._recycle_retention_days}}
 
     def restore_api(self, id: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         try:
             rec = self.get_data("recycle") or {}
         except Exception:
             rec = {}
         item = rec.get(id)
         if not item:
-            return {"success": False, "message": "回收站中无此记录"}
+            return {'success': False, 'message': '回收站中无此记录', 'data': None}
         inst, dtype = self._get_downloader(item.get("downloader") or "")
         if not inst:
-            return {"success": False, "message": f"原下载器 {item.get('downloader')} 不可用"}
+            return {'success': False, 'message': f"原下载器 {item.get('downloader')} 不可用", 'data': None}
         import os
         content = None
         if item.get("bk_type") == "torrent" and item.get("bk_file"):
             path = os.path.join(self._recycle_dir(), item["bk_file"])
             if not os.path.isfile(path):
-                return {"success": False, "message": "备份种子文件缺失"}
+                return {'success': False, 'message': '备份种子文件缺失', 'data': None}
             try:
                 with open(path, "rb") as f:
                     content = f.read()
             except Exception as e:
-                return {"success": False, "message": f"读取备份文件失败：{e}"}
+                return {'success': False, 'message': f'读取备份文件失败：{e}', 'data': None}
         elif item.get("bk_magnet"):
             content = str(item["bk_magnet"])
         if not content:
-            return {"success": False, "message": "无可用备份材料"}
+            return {'success': False, 'message': '无可用备份材料', 'data': None}
         try:
             if "transmission" in (dtype or ""):
                 t = inst.add_torrent(content=content, is_paused=True,
@@ -1537,9 +1532,9 @@ class CrossSeedCleaner(_PluginBase):
                 ok, _ = inst.add_torrent(content=content, is_paused=True,
                                          download_dir=item.get("save_path") or None)
         except Exception as e:
-            return {"success": False, "message": f"添加种子失败：{e}"}
+            return {'success': False, 'message': f'添加种子失败：{e}', 'data': None}
         if not ok:
-            return {"success": False, "message": "添加种子失败（下载器返回失败）"}
+            return {'success': False, 'message': '添加种子失败（下载器返回失败）', 'data': None}
         h = item.get("hash") or ""
         if h:
             try:
@@ -1558,19 +1553,18 @@ class CrossSeedCleaner(_PluginBase):
             except Exception:
                 pass
         logger.info(f"跨站独苗种子清理：已恢复种子 {str(item.get('name', ''))[:40]}")
-        return {"success": True, "message": "恢复成功：已重新添加并校验数据"
-                + ("（原数据已删，将重新下载）" if item.get("deleted_file") else "")}
+        return {'success': True, 'message': '恢复成功：已重新添加并校验数据' + ('（原数据已删，将重新下载）' if item.get('deleted_file') else ''), 'data': None}
 
     def recycle_delete_api(self, id: str = "") -> Dict[str, Any]:
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         try:
             rec = self.get_data("recycle") or {}
         except Exception:
             rec = {}
         item = rec.pop(id, None)
         if not item:
-            return {"success": False, "message": "回收站中无此记录"}
+            return {'success': False, 'message': '回收站中无此记录', 'data': None}
         self.save_data("recycle", rec)
         if item.get("bk_file"):
             try:
@@ -1578,11 +1572,11 @@ class CrossSeedCleaner(_PluginBase):
                 os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
             except Exception:
                 pass
-        return {"success": True, "message": "已清除该备份"}
+        return {'success': True, 'message': '已清除该备份', 'data': None}
 
     def recycle_clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("recycle", {})
         try:
             import os
@@ -1595,15 +1589,15 @@ class CrossSeedCleaner(_PluginBase):
                         pass
         except Exception:
             pass
-        return {"success": True, "message": "回收站已清空"}
+        return {'success': True, 'message': '回收站已清空', 'data': None}
 
     # ==================== 删除 API ====================
 
     def delete_api(self, id: str, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         groups = saved.get("groups") or []
         target = None
@@ -1615,23 +1609,23 @@ class CrossSeedCleaner(_PluginBase):
             if target:
                 break
         if not target:
-            return {"success": False, "message": "条目不存在，请重新扫描"}
+            return {'success': False, 'message': '条目不存在，请重新扫描', 'data': None}
         ok, _, _, _ = self._delete_entries([target])
-        return {"success": ok > 0, "message": f"已删除 {ok} 个" if ok else "删除失败"}
+        return {'success': ok > 0, 'message': f'已删除 {ok} 个' if ok else '删除失败', 'data': None}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         selected = self._sel
         if not selected:
-            return {"success": False, "message": "未勾选任何条目"}
+            return {'success': False, 'message': '未勾选任何条目', 'data': None}
         saved = self.get_data("result") or {}
         groups = saved.get("groups") or []
         targets = [e for g in groups for e in g.get("entries", []) if e.get("id") in selected]
         if not targets:
-            return {"success": False, "message": "勾选条目不在结果中，请重新扫描"}
+            return {'success': False, 'message': '勾选条目不在结果中，请重新扫描', 'data': None}
         ok, kept, site_stats, t_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站独苗种子清理：删除勾选完成 {ok}/{len(targets)}")
@@ -1642,18 +1636,18 @@ class CrossSeedCleaner(_PluginBase):
                 + self._transfer_stats_text(t_stats)
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
-        return {"success": True, "ok": ok, "total": len(targets)}
+        return {'success': True, 'message': '', 'data': {'ok': ok, 'total': len(targets)}}
 
     def delete_all_api(self, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         groups = saved.get("groups") or []
         targets = [e for g in groups for e in g.get("entries", [])]
         if not targets:
-            return {"success": False, "message": "当前无结果"}
+            return {'success': False, 'message': '当前无结果', 'data': None}
         ok, kept, site_stats, t_stats = self._delete_entries(targets)
         total_freed = sum(s.get("freed", 0) for s in site_stats.values())
         logger.info(f"跨站独苗种子清理：全部删除完成 {ok}/{len(targets)}")
@@ -1664,14 +1658,14 @@ class CrossSeedCleaner(_PluginBase):
                 + self._transfer_stats_text(t_stats)
                 + (f"，{len(kept)} 条数据因组外辅种引用改为仅删任务" if kept else "")
                 + f"\n站点统计：\n{self._fmt_site_stats(site_stats)}")
-        return {"success": True, "ok": ok, "total": len(targets)}
+        return {'success': True, 'message': '', 'data': {'ok': ok, 'total': len(targets)}}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("result", {"time": "", "groups": [], "stat": {}})
         self._sel = []
-        return {"success": True}
+        return {'success': True, 'message': '', 'data': None}
 
     # ==================== 通知与停止 ====================
 
