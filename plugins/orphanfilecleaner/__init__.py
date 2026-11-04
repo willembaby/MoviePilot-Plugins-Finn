@@ -39,7 +39,7 @@ class OrphanFileCleaner(_PluginBase):
                    "（删种留文件、迁移残留等），按文件夹分类展示、勾选批量删除、"
                    "检测硬链接并列出地址，支持一键移入回收站或彻底删除。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/clean.png"
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "orphanfilecleaner_"
@@ -805,10 +805,10 @@ class OrphanFileCleaner(_PluginBase):
     def scan_api(self) -> Dict[str, Any]:
         """扫描 API：收集引用 + 遍历配置目录，结果存插件数据"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         dirs = [d.strip() for d in (self._scan_dirs or "").splitlines() if d.strip()]
         if not dirs:
-            return {"success": False, "message": "未配置扫描目录"}
+            return {"success": False, "message": "未配置扫描目录", "data": None}
         trash_stats = self._clean_trash()  # v1.7：扫描前先清理回收站过期文件
         logger.info("孤儿文件清理：开始扫描，收集下载器种子引用集合...")
         cr = sorted(self._collect_roots())
@@ -843,17 +843,17 @@ class OrphanFileCleaner(_PluginBase):
             if t_line:
                 text += "\n" + t_line
             self._send_notify(text)
-        return {"success": True, "total": len(items), "items": items}
+        return {"success": True, "message": f"扫描完成，发现 {len(items)} 个孤儿文件", "data": {"total": len(items), "items": items}}
 
     def delete_api(self, path: str) -> Dict[str, Any]:
         """删除单个孤儿"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         if not path:
-            return {"success": False, "message": "未指定路径"}
+            return {"success": False, "message": "未指定路径", "data": None}
         # 路径安全校验：必须位于已配置扫描目录范围内
         if not self._is_in_scan_dirs(path):
-            return {"success": False, "message": "路径不在扫描目录范围内，已拒绝"}
+            return {"success": False, "message": "路径不在扫描目录范围内，已拒绝", "data": None}
         ok, msg = self._delete_path(path)
         if ok:
             self._append_deleted(f"已{'移入回收站' if self._delete_mode == 'trash' else '删除'}: {path}")
@@ -863,18 +863,18 @@ class OrphanFileCleaner(_PluginBase):
             if path in selected:
                 selected.remove(path)
                 self._sel = selected
-        return {"success": ok, "message": msg}
+        return {"success": ok, "message": msg, "data": {"ok": ok}}
 
     def delete_all_api(self, confirm: str = "") -> Dict[str, Any]:
         """删除全部孤儿（需 confirm=yes）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {"success": False, "message": "请确认参数 confirm=yes", "data": None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         if not items:
-            return {"success": False, "message": "当前无扫描结果"}
+            return {"success": False, "message": "当前无扫描结果", "data": None}
         ok_count = 0
         for it in items:
             p = it.get("path", "")
@@ -891,17 +891,17 @@ class OrphanFileCleaner(_PluginBase):
             mode = "移入回收站" if self._delete_mode == "trash" else "彻底删除"
             self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-批量处理\n"
                               f"成功 {ok_count}/{len(items)} 个（{mode}）")
-        return {"success": True, "ok": ok_count, "total": len(items)}
+        return {"success": True, "message": f"批量处理完成：成功 {ok_count}/{len(items)} 个", "data": {"ok": ok_count, "total": len(items)}}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
         """批量删除勾选中的孤儿（需 confirm=yes）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {"success": False, "message": "请确认参数 confirm=yes", "data": None}
         selected = self._sel
         if not selected:
-            return {"success": False, "message": "未勾选任何孤儿文件"}
+            return {"success": False, "message": "未勾选任何孤儿文件", "data": None}
         ok_count = 0
         for p in selected:
             if not self._is_in_scan_dirs(p):
@@ -920,12 +920,12 @@ class OrphanFileCleaner(_PluginBase):
             mode = "移入回收站" if self._delete_mode == "trash" else "彻底删除"
             self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-批量删除勾选\n"
                               f"成功 {ok_count}/{len(selected)} 个（{mode}）")
-        return {"success": True, "ok": ok_count, "total": len(selected)}
+        return {"success": True, "message": f"删除勾选项完成：成功 {ok_count}/{len(selected)} 个", "data": {"ok": ok_count, "total": len(selected)}}
 
     def toggle_api(self, path: str) -> Dict[str, Any]:
         """切换勾选状态"""
         if not path:
-            return {"success": False, "message": "未指定路径"}
+            return {"success": False, "message": "未指定路径", "data": None}
         selected = self._sel
         if path in selected:
             selected.remove(path)
@@ -934,17 +934,17 @@ class OrphanFileCleaner(_PluginBase):
             selected.append(path)
             msg = "已勾选"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {"success": True, "message": msg, "data": {"selected_count": len(selected)}}
 
     def toggle_group_api(self, dir: str) -> Dict[str, Any]:
         """一键选中/取消整个文件夹组的孤儿"""
         if not dir:
-            return {"success": False, "message": "未指定文件夹"}
+            return {"success": False, "message": "未指定文件夹", "data": None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         group_paths = [it.get("path") for it in items if it.get("dir") == dir]
         if not group_paths:
-            return {"success": False, "message": "该文件夹无孤儿条目"}
+            return {"success": False, "message": "该文件夹无孤儿条目", "data": None}
         selected = self._sel
         group_set = set(group_paths)
         # 组内全部已选中 → 取消全部；否则全选
@@ -958,21 +958,21 @@ class OrphanFileCleaner(_PluginBase):
             msg = f"已勾选 {len(group_paths)} 项"
         self._sel = selected
         logger.info(f"孤儿文件清理：[{dir}] 组级勾选 {msg}")
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {"success": True, "message": msg, "data": {"selected_count": len(selected)}}
 
     def delete_dir_api(self, dir: str, confirm: str = "") -> Dict[str, Any]:
         """一键删除文件夹组内全部孤儿（需 confirm=yes）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         if not dir:
-            return {"success": False, "message": "未指定文件夹"}
+            return {"success": False, "message": "未指定文件夹", "data": None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {"success": False, "message": "请确认参数 confirm=yes", "data": None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         group_items = [it for it in items if it.get("dir") == dir]
         if not group_items:
-            return {"success": False, "message": "该文件夹无孤儿条目"}
+            return {"success": False, "message": "该文件夹无孤儿条目", "data": None}
         ok_count = 0
         for it in group_items:
             p = it.get("path", "")
@@ -993,15 +993,15 @@ class OrphanFileCleaner(_PluginBase):
             mode = "移入回收站" if self._delete_mode == "trash" else "彻底删除"
             self._send_notify(f"{self._notify_title_prefix}: 孤儿文件清理-删除文件夹组\n"
                               f"[{dir}] 成功 {ok_count}/{len(group_items)} 个（{mode}）")
-        return {"success": True, "ok": ok_count, "total": len(group_items)}
+        return {"success": True, "message": f"组级删除完成：成功 {ok_count}/{len(group_items)} 个", "data": {"ok": ok_count, "total": len(group_items)}}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         """清空扫描结果"""
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {"success": False, "message": "请确认参数 confirm=yes", "data": None}
         self.save_data("result", {"time": "", "items": [], "total": 0})
         self._sel = []
-        return {"success": True}
+        return {"success": True, "message": "已清空扫描结果", "data": None}
 
     # ==================== 工具 ====================
 
@@ -1168,22 +1168,24 @@ class OrphanFileCleaner(_PluginBase):
     def clean_trash_api(self) -> Dict[str, Any]:
         """手动触发回收站过期清理（API）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {"success": False, "message": "插件未启用", "data": None}
         stats = self._clean_trash()
         if stats is None:
-            return {"success": False, "message": "非回收站模式或保留天数为 0（永不清理）"}
+            return {"success": False, "message": "非回收站模式或保留天数为 0（永不清理）", "data": None}
         if stats.get("first_run"):
-            return {"success": True, "first_run": True, "marked": stats.get("marked", 0),
-                    "retention_days": self._trash_retention_days,
+            return {"success": True,
                     "message": (f"首次初始化：{stats.get('marked', 0)} 个存量条目已重置计时，"
-                                f"{self._trash_retention_days} 天后开始自动清理")}
-        return {"success": True, "removed": stats.get("removed", 0),
-                "freed_bytes": stats.get("freed_bytes", 0),
-                "retention_days": self._trash_retention_days,
-                "freed": self._fmt_size(stats.get("freed_bytes", 0)),
+                                f"{self._trash_retention_days} 天后开始自动清理"),
+                    "data": {"first_run": True, "marked": stats.get("marked", 0),
+                             "retention_days": self._trash_retention_days}}
+        return {"success": True,
                 "message": (f"已清理过期文件 {stats.get('removed', 0)} 项，"
                             f"释放 {self._fmt_size(stats.get('freed_bytes', 0))}"
-                            if stats.get("removed") else "无过期文件")}
+                            if stats.get("removed") else "无过期文件"),
+                "data": {"removed": stats.get("removed", 0),
+                         "freed_bytes": stats.get("freed_bytes", 0),
+                         "retention_days": self._trash_retention_days,
+                         "freed": self._fmt_size(stats.get("freed_bytes", 0))}}
 
     def _schedule_trash_clean(self):
         """定时清理入口（仅清过期 trash 文件，不扫描不删孤儿）"""
