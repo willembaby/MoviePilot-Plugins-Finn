@@ -37,7 +37,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     plugin_desc = ("扫描 MoviePilot 与自定义下载器中的死种（依据 tracker 状态判定为站点已删除），"
                    "提供勾选/全选/删除，支持辅种保护删除数据文件，定时与手动触发，飞书或系统通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.7"
+    plugin_version = "1.7.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "sitedeletedtorrentcleaner_"
@@ -851,7 +851,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     def scan_api(self) -> Dict[str, Any]:
         """手动扫描"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         logger.info("站点已删除种子清理：开始扫描下载器死种...")
         rec_stats = self._clean_recycle()  # v1.7：手动扫描同样顺带清理回收站过期备份
         dead_items, _ = self._scan_all()
@@ -866,13 +866,13 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             if rec_line:
                 text += "\n" + rec_line
             self._send_notification(text)
-        return {"success": True, "total": len(dead_items), "items": dead_items}
+        return {'success': True, 'message': '', 'data': {'total': len(dead_items), 'items': dead_items}}
 
     # ==================== 勾选 ====================
 
     def toggle_api(self, id: str) -> Dict[str, Any]:
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         selected = self._sel
         if id in selected:
             selected.remove(id)
@@ -881,7 +881,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             selected.append(id)
             msg = "已勾选"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     def toggle_all_api(self, dl: str = "", site: str = "") -> Dict[str, Any]:
         """组内/全部一键勾选（dl/site 均空则全部；site=__NONE__ 表示未知站点组；优先 dl）"""
@@ -896,7 +896,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         else:
             ids = [it.get("id") for it in items]
         if not ids:
-            return {"success": False, "message": "当前无结果"}
+            return {'success': False, 'message': '当前无结果', 'data': None}
         selected = self._sel
         id_set = set(ids)
         if all(i in selected for i in ids):
@@ -908,7 +908,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                     selected.append(i)
             msg = f"已勾选 {len(ids)} 项"
         self._sel = selected
-        return {"success": True, "message": msg, "selected_count": len(selected)}
+        return {'success': True, 'message': msg, 'data': {'selected_count': len(selected)}}
 
     # ==================== 删除（带辅种保护） ====================
 
@@ -1124,45 +1124,40 @@ class SiteDeletedTorrentCleaner(_PluginBase):
     def clean_recycle_api(self) -> Dict[str, Any]:
         """手动触发回收站过期清理（API）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         stats = self._clean_recycle()
         if stats is None:
-            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
-        return {"success": True, "removed": stats.get("removed", 0),
-                "torrent_files": stats.get("torrent_files", 0),
-                "remaining": stats.get("remaining", 0),
-                "retention_days": self._recycle_retention_days,
-                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
-                            if stats.get("removed") else "无过期备份")}
+            return {'success': False, 'message': '回收站未启用或保留天数为 0（永不清理）', 'data': None}
+        return {'success': True, 'message': f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条" if stats.get('removed') else '无过期备份', 'data': {'removed': stats.get('removed', 0), 'torrent_files': stats.get('torrent_files', 0), 'remaining': stats.get('remaining', 0), 'retention_days': self._recycle_retention_days}}
 
     def restore_api(self, id: str = "") -> Dict[str, Any]:
         """从回收站恢复误删种子：重新添加（含原保存路径）→ 重新校验 → 开始任务"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         rec = self.get_data("recycle") or {}
         item = rec.get(id)
         if not item:
-            return {"success": False, "message": "回收站中无此记录"}
+            return {'success': False, 'message': '回收站中无此记录', 'data': None}
         inst, dtype = self._get_downloader(item.get("downloader") or "")
         if not inst:
-            return {"success": False, "message": f"原下载器 {item.get('downloader')} 不可用（自定义配置可能已修改）"}
+            return {'success': False, 'message': f"原下载器 {item.get('downloader')} 不可用（自定义配置可能已修改）", 'data': None}
         # 备份材料
         content = None
         if item.get("bk_type") == "torrent" and item.get("bk_file"):
             path = os.path.join(self._recycle_dir(), item["bk_file"])
             if not os.path.isfile(path):
-                return {"success": False, "message": "备份种子文件缺失，无法恢复"}
+                return {'success': False, 'message': '备份种子文件缺失，无法恢复', 'data': None}
             try:
                 with open(path, "rb") as f:
                     content = f.read()
             except Exception as e:
-                return {"success": False, "message": f"读取备份文件失败：{e}"}
+                return {'success': False, 'message': f'读取备份文件失败：{e}', 'data': None}
         elif item.get("bk_magnet"):
             content = str(item["bk_magnet"])
         if not content:
-            return {"success": False, "message": "无可用备份材料"}
+            return {'success': False, 'message': '无可用备份材料', 'data': None}
         # 重新添加（暂停添加→校验→启动，避免立刻覆盖已有数据）
         try:
             if "transmission" in (dtype or ""):
@@ -1173,9 +1168,9 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                 ok, _ = inst.add_torrent(content=content, is_paused=True,
                                          download_dir=item.get("save_path") or None)
         except Exception as e:
-            return {"success": False, "message": f"添加种子失败：{e}"}
+            return {'success': False, 'message': f'添加种子失败：{e}', 'data': None}
         if not ok:
-            return {"success": False, "message": "添加种子失败（下载器返回失败）"}
+            return {'success': False, 'message': '添加种子失败（下载器返回失败）', 'data': None}
         h = item.get("hash") or ""
         if h:
             try:
@@ -1195,29 +1190,28 @@ class SiteDeletedTorrentCleaner(_PluginBase):
             except Exception:
                 pass
         logger.info(f"站点已删除种子清理：已恢复种子 {item.get('name', '')[:40]} → {item.get('downloader')}")
-        return {"success": True,
-                "message": "恢复成功：已重新添加并校验数据" + ("（原数据已删，将重新下载）" if item.get("deleted_file") else "")}
+        return {'success': True, 'message': '恢复成功：已重新添加并校验数据' + ('（原数据已删，将重新下载）' if item.get('deleted_file') else ''), 'data': None}
 
     def recycle_delete_api(self, id: str = "") -> Dict[str, Any]:
         """清除回收站单条备份（不可恢复）"""
         if not id:
-            return {"success": False, "message": "未指定条目"}
+            return {'success': False, 'message': '未指定条目', 'data': None}
         rec = self.get_data("recycle") or {}
         item = rec.pop(id, None)
         if not item:
-            return {"success": False, "message": "回收站中无此记录"}
+            return {'success': False, 'message': '回收站中无此记录', 'data': None}
         self.save_data("recycle", rec)
         if item.get("bk_file"):
             try:
                 os.remove(os.path.join(self._recycle_dir(), item["bk_file"]))
             except Exception:
                 pass
-        return {"success": True, "message": "已清除该备份"}
+        return {'success': True, 'message': '已清除该备份', 'data': None}
 
     def recycle_clear_api(self, confirm: str = "") -> Dict[str, Any]:
         """清空回收站"""
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("recycle", {})
         # 清理备份目录中的 .torrent 文件
         try:
@@ -1230,34 +1224,34 @@ class SiteDeletedTorrentCleaner(_PluginBase):
                         pass
         except Exception:
             pass
-        return {"success": True, "message": "回收站已清空"}
+        return {'success': True, 'message': '回收站已清空', 'data': None}
 
     def delete_api(self, id: str, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         target = next((it for it in items if it.get("id") == id), None)
         if not target:
-            return {"success": False, "message": "条目不存在"}
+            return {'success': False, 'message': '条目不存在', 'data': None}
         ok, _ = self._delete_entries([target])
-        return {"success": ok > 0, "message": f"已删除 {ok} 个" if ok else "删除失败"}
+        return {'success': ok > 0, 'message': f'已删除 {ok} 个' if ok else '删除失败', 'data': None}
 
     def delete_selected_api(self, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         selected = self._sel
         if not selected:
-            return {"success": False, "message": "未勾选任何死种"}
+            return {'success': False, 'message': '未勾选任何死种', 'data': None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         targets = [it for it in items if it.get("id") in selected]
         if not targets:
-            return {"success": False, "message": "勾选的条目不在结果中，请重新扫描"}
+            return {'success': False, 'message': '勾选的条目不在结果中，请重新扫描', 'data': None}
         ok, _ = self._delete_entries(targets)
         self._sel = []
         saved["items"] = [it for it in items if it.get("id") not in selected]
@@ -1266,14 +1260,14 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         logger.info(f"站点已删除种子清理：批量删除勾选完成 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-清理勾选 {ok}/{len(targets)} 个死种")
-        return {"success": True, "ok": ok, "total": len(targets)}
+        return {'success': True, 'message': '', 'data': {'ok': ok, 'total': len(targets)}}
 
     def delete_all_api(self, dl: str = "", site: str = "", confirm: str = "") -> Dict[str, Any]:
         """删除全部/本组死种（dl/site 均空则全部；site=__NONE__ 表示未知站点组；优先 dl）"""
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         items = saved.get("items") or []
         if dl:
@@ -1285,7 +1279,7 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         else:
             targets = items
         if not targets:
-            return {"success": False, "message": "当前无结果"}
+            return {'success': False, 'message': '当前无结果', 'data': None}
         ok, _ = self._delete_entries(targets)
         del_ids = {it.get("id") for it in targets}
         saved["items"] = [it for it in saved.get("items", []) if it.get("id") not in del_ids]
@@ -1295,14 +1289,14 @@ class SiteDeletedTorrentCleaner(_PluginBase):
         logger.info(f"站点已删除种子清理：删除完成 成功 {ok}/{len(targets)}")
         if self._notify and ok:
             self._send_notification(f"{self._notify_title_prefix}: 站点已删除种子清理-删除 {ok}/{len(targets)} 个死种")
-        return {"success": True, "ok": ok, "total": len(targets)}
+        return {'success': True, 'message': '', 'data': {'ok': ok, 'total': len(targets)}}
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("result", {"time": "", "items": [], "total": 0})
         self._sel = []
-        return {"success": True}
+        return {'success': True, 'message': '', 'data': None}
 
     # ==================== 通知 ====================
 
