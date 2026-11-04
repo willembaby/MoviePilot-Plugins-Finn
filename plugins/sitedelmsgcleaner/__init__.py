@@ -75,7 +75,7 @@ class SiteDelMsgCleaner(_PluginBase):
     plugin_name = "站点删种消息自动清理"
     plugin_desc = "检测站点删除种子类站内信，自动删除对应下载器种子、数据源文件与转移记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "Finn"
     author_url = ""
     plugin_config_prefix = "sitedelmsgcleaner_"
@@ -477,14 +477,14 @@ class SiteDelMsgCleaner(_PluginBase):
 
     def scan_api(self) -> dict:
         if not self.get_state():
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         result = self._scan_recent_messages()
         self._clean_recycle()
-        return {"success": True, **result}
+        return {'success': True, 'message': '', 'data': result}
 
     def clear_recycle(self) -> dict:
         self.save_data(self._recycle_key(), [])
-        return {"success": True, "message": "已清空回收站记录"}
+        return {'success': True, 'message': '已清空回收站记录', 'data': None}
 
     def stop_service(self):
         if self._scheduler:
