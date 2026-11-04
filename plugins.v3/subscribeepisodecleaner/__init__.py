@@ -112,7 +112,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
                    "删除的集号写入各订阅 note（已下载集），MoviePilot 搜索/刷新将其视为已下载，"
                    "不会通过订阅再次重新下载；含未完成保护、回收站备份自动过期清理、通知。")
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/tv.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribeepisodecleaner_"
@@ -1165,9 +1165,9 @@ class SubscribeEpisodeCleaner(_PluginBase):
 
     def scan_api(self) -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if not self._subscribe_ids:
-            return {"success": False, "message": "未选择订阅"}
+            return {'success': False, 'message': '未选择订阅', 'data': None}
         # 手动扫描同样顺带执行回收站过期清理（v1.6）
         rec_stats = self._clean_recycle()
         subs = []
@@ -1189,8 +1189,7 @@ class SubscribeEpisodeCleaner(_PluginBase):
         if subs:
             self._snapshot_registry(subs)
         if not subs:
-            return {"success": True, "subs": 0, "candidates": 0, "free_size": 0,
-                    "message": "所选订阅均已完结并按完结策略处理"}
+            return {'success': True, 'message': '所选订阅均已完结并按完结策略处理', 'data': {'subs': 0, 'candidates': 0, 'free_size': 0}}
         items = self._scan_all()
         agg = self._analyze_all(subs, items)
         self.save_data("result", agg)
@@ -1212,29 +1211,26 @@ class SubscribeEpisodeCleaner(_PluginBase):
                     f"共 {len(subs)} 个订阅，待清理 {len(agg.get('candidates') or [])} 个种子，"
                     f"释放约 {self._fmt_size(agg.get('free_size', 0))}\n" + "\n".join(lines))
             self._send_notification(text)
-        return {"success": True, "subs": len(subs),
-                "candidates": len(agg["candidates"]),
-                "free_size": agg["free_size"]}
+        return {'success': True, 'message': '', 'data': {'subs': len(subs), 'candidates': len(agg['candidates']), 'free_size': agg['free_size']}}
 
     # ==================== 执行清理 ====================
 
     def run_api(self, confirm: str = "") -> Dict[str, Any]:
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            return {'success': False, 'message': '插件未启用', 'data': None}
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         saved = self.get_data("result") or {}
         candidates = saved.get("candidates") or []
         if not candidates:
-            return {"success": False, "message": "无待清理结果，请先扫描分析"}
+            return {'success': False, 'message': '无待清理结果，请先扫描分析', 'data': None}
         ok, kept, t_stats, o_stats, adv = self._execute(candidates)
         # 执行清理后顺带维护回收站（v1.6：刚写入的新备份不会过期，仅清旧备份）
         rec_stats = self._clean_recycle()
         # 执行回执通知（v1.4：每次执行后必发，含删除/释放/防重下汇总；v1.7.1 带开始集数前移）
         if self._notify:
             self._send_exec_notification(ok, kept, t_stats, o_stats, len(candidates), rec_stats, adv)
-        return {"success": True, "ok": ok, "total": len(candidates),
-                "kept": len(kept), "transfer": t_stats, "orphan": o_stats}
+        return {'success': True, 'message': '', 'data': {'ok': ok, 'total': len(candidates), 'kept': len(kept), 'transfer': t_stats, 'orphan': o_stats}}
 
     def _send_exec_notification(self, ok: int, kept: List[str], t_stats: Dict[str, int],
                                  o_stats: Dict[str, int], total: int, rec_stats: Optional[Dict[str, int]] = None,
@@ -1739,21 +1735,16 @@ class SubscribeEpisodeCleaner(_PluginBase):
 
     def clear_api(self, confirm: str = "") -> Dict[str, Any]:
         if confirm != "yes":
-            return {"success": False, "message": "请确认参数 confirm=yes"}
+            return {'success': False, 'message': '请确认参数 confirm=yes', 'data': None}
         self.save_data("result", {})
-        return {"success": True}
+        return {'success': True, 'message': '', 'data': None}
 
     def clean_recycle_api(self) -> Dict[str, Any]:
         """手动触发回收站过期清理（API）"""
         stats = self._clean_recycle()
         if stats is None:
-            return {"success": False, "message": "回收站未启用或保留天数为 0（永不清理）"}
-        return {"success": True, "removed": stats.get("removed", 0),
-                "torrent_files": stats.get("torrent_files", 0),
-                "remaining": stats.get("remaining", 0),
-                "retention_days": self._recycle_retention_days,
-                "message": (f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条"
-                            if stats.get("removed") else "无过期备份")}
+            return {'success': False, 'message': '回收站未启用或保留天数为 0（永不清理）', 'data': None}
+        return {'success': True, 'message': f"已清理过期备份 {stats.get('removed', 0)} 条，剩余 {stats.get('remaining', 0)} 条" if stats.get('removed') else '无过期备份', 'data': {'removed': stats.get('removed', 0), 'torrent_files': stats.get('torrent_files', 0), 'remaining': stats.get('remaining', 0), 'retention_days': self._recycle_retention_days}}
 
     # ==================== 通知与停止 ====================
 
