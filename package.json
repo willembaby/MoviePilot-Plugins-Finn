@@ -23,13 +23,15 @@
     "name": "订阅日历监控",
     "description": "每日定时检查当日播出的订阅剧集是否已下载入库并发送通知（飞书Webhook或系统消息）。",
     "labels": "订阅",
-    "version": "1.2",
+    "version": "2.0.1",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png",
     "author": "Finn",
     "level": 1,
     "v2": true,
     "v3": false,
     "history": {
+      "v2.0.1": "新增：当天所有订阅剧集均已下载入库时，通知中逐行列出当天下载的剧集名称与集号（如「▶ 遮天 S1E5,E6」），集号按升序排列；部分未下载的通知格式保持不变",
+      "v2.0.0": "V3 迁移版：订阅身份由 tmdbid 迁移到 media_source/media_id（仅 TMDB 来源参与日历比对）；导入迁移到 app.sdk 稳定入口；链调用沿 V3 门面",
       "v1.2": "重新排版插件页面：开关独立一行、Webhook独占整行；修复立即运行一次不生效的调度器问题",
       "v1.1": "优化通知文案与检查逻辑",
       "v1.0": "首个版本：TMDB播出日历+媒体库文件状态比对，当日剧集入库检查"
