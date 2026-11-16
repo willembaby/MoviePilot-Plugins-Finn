@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# V3 专用版 2.0.0：订阅身份由 tmdbid 迁移到 media_source/media_id（仅 TMDB 来源参与日历比对）；
+# 导入迁移到 app.sdk 稳定入口；链调用（TmdbChain.tmdb_episodes / SubscribeChain.subscribe_files_info）沿用 V3 门面。
 
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
@@ -8,10 +11,10 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.chain.subscribe import SubscribeChain
 from app.chain.tmdb import TmdbChain
-from app.core.config import settings
-from app.db.subscribe_oper import SubscribeOper
-from app.log import logger
-from app.plugins import _PluginBase
+from app.sdk.config import settings
+from app.db.oper.subscribe import SubscribeOper
+from app.sdk.logging import logger
+from app.sdk.plugin.base import _PluginBase
 
 import requests
 
@@ -24,9 +27,9 @@ class SubscribeCalendarMonitor(_PluginBase):
 
     # 插件元数据
     plugin_name = "订阅日历监控"
-    plugin_desc = "监控订阅剧集播出情况，检查当日播出剧集是否已下载入库，并发送通知。"
+    plugin_desc = "监控订阅剧集播出情况，检查当日播出剧集是否已下载入库，并发送通知。V3 专用版：订阅身份迁移到 media_source/media_id，导入迁移到 app.sdk 稳定入口。"
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png"
-    plugin_version = "1.2"
+    plugin_version = "2.0.1"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribecalendarmonitor_"
@@ -46,6 +49,19 @@ class SubscribeCalendarMonitor(_PluginBase):
     _subscribe_oper = None
     _subscribe_chain = None
     _tmdb_chain = None
+
+    @staticmethod
+    def _get_tmdb_id(info) -> Optional[int]:
+        """V3：从订阅媒体身份对（media_source/media_id）取 TMDB 来源 id。
+        仅当来源为 themoviedb/tmdb 时返回 int 化 media_id，否则返回 None。"""
+        src = str(getattr(info, "media_source", "") or "").strip().lower()
+        if src not in ("themoviedb", "tmdb"):
+            return None
+        mid = str(getattr(info, "media_id", "") or "").strip()
+        try:
+            return int(mid)
+        except (TypeError, ValueError):
+            return None
 
     def init_plugin(self, config: dict = None):
         # 依赖初始化
@@ -82,13 +98,6 @@ class SubscribeCalendarMonitor(_PluginBase):
 
     def get_state(self) -> bool:
         return self._enabled
-
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        pass
-
-    def get_api(self) -> List[Dict[str, Any]]:
-        pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -208,6 +217,13 @@ class SubscribeCalendarMonitor(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
+    def get_api(self) -> List[Dict[str, Any]]:
+        pass
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        pass
+
     def get_service(self) -> List[Dict[str, Any]]:
         """
         注册插件定时服务
@@ -273,7 +289,7 @@ class SubscribeCalendarMonitor(_PluginBase):
 
     def _check_today_episodes(self, today: str) -> dict:
         """
-        检查当日播出的订阅剧集状态
+        检查当天播出的订阅剧集状态
         使用 SubscribeOper.list() 获取订阅列表，TmdbChain.tmdb_episodes() 查询播出日期，
         SubscribeChain.subscribe_files_info() 判断每集是否已下载/入库
         """
@@ -288,14 +304,15 @@ class SubscribeCalendarMonitor(_PluginBase):
         result["active_tv_subs"] = len(tv_subs)
 
         for sub in tv_subs:
-            if not sub.tmdbid or sub.season is None:
+            tmdbid = self._get_tmdb_id(sub)
+            if tmdbid is None or sub.season is None:
                 continue
 
             # 查询本季播出日期（TmdbChain 走模块代理与缓存，稳定可靠）
             today_ep_nums = []
             try:
                 episodes = self._tmdb_chain.tmdb_episodes(
-                    tmdbid=sub.tmdbid, season=sub.season, episode_group=sub.episode_group
+                    tmdbid=tmdbid, season=sub.season, episode_group=sub.episode_group
                 )
                 if episodes:
                     for ep in episodes:
@@ -377,7 +394,12 @@ class SubscribeCalendarMonitor(_PluginBase):
                     unk_str = ",".join(f"E{e}" for e in sorted(unknown))
                     lines.append(f"  ▶ {s['name']} {season_str}{unk_str} 状态查询失败")
         else:
-            lines.append("✅ 今日所有播出剧集均已下载入库")
+            # 全部下载完成：列出当天下载的剧集名称与集号
+            lines.append("✅ 今日所有播出剧集均已下载入库：")
+            for s in today_eps:
+                season_str = f"S{s['season']}" if s.get("season") is not None else ""
+                ep_str = ",".join(f"E{e['ep']}" for e in sorted(s["eps"], key=lambda x: x["ep"]))
+                lines.append(f"  ▶ {s['name']} {season_str}{ep_str}")
 
         if ok_subs and missing_subs:
             ok_names = "、".join(s["name"] for s in ok_subs)
