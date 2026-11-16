@@ -71,11 +71,29 @@ _re_seed_name = re.compile(r"种子[：: ]?\s*([^\s，。;'\",\n]{6,}?)\s*(?:被
 _re_site = re.compile(r"(?:【)?站点\s*([^\s】。]+)")
 
 
+def _is_site_message(mtype) -> bool:
+    """
+    兼容 V2/V3 的站点消息类型判定。
+
+    V3 中 NotificationType.SiteMessage 实际是纯 Enum（MessageType，非 str 枚举），
+    直接与字符串比较恒为 False；而实时事件的 event_data 里 mtype 可能是枚举对象，
+    DB message.mtype 列存的却是中文字符串 '站点'。统一取 .value（枚举）或自身
+    （字符串）后按字符串比较，两种来源都能正确识别。
+    """
+    if mtype is None:
+        return False
+    val = getattr(mtype, "value", mtype)
+    try:
+        return str(val) == str(NotificationType.SiteMessage.value)
+    except Exception:
+        return str(val) == "站点"
+
+
 class SiteDelMsgCleaner(_PluginBase):
     plugin_name = "站点删种消息自动清理"
     plugin_desc = "检测站点删除种子类站内信，自动删除对应下载器种子、数据源文件与转移记录"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "Finn"
     author_url = ""
     plugin_config_prefix = "sitedelmsgcleaner_"
@@ -153,7 +171,7 @@ class SiteDelMsgCleaner(_PluginBase):
         if data.get("channel"):
             return
         msg_type = data.get("type") or data.get("mtype")
-        if msg_type != NotificationType.SiteMessage:
+        if not _is_site_message(msg_type):
             return
         title = str(data.get("title") or "")
         text = str(data.get("text") or "")
@@ -201,7 +219,7 @@ class SiteDelMsgCleaner(_PluginBase):
         total = 0
         for m in msgs:
             mtype = getattr(m, "mtype", None)
-            if mtype != NotificationType.SiteMessage:
+            if not _is_site_message(mtype):
                 continue
             title = str(getattr(m, "title", "") or "")
             text = str(getattr(m, "text", "") or "")
