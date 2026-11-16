@@ -150,13 +150,14 @@
     "name": "站点删种消息自动清理",
     "description": "监听 MoviePilot 内置「站点数据刷新解析未读站内信」推送的站点消息（EventType.NoticeMessage，mtype=站点），检测到「种子被删除」类站内信自动删除对应下载器种子、数据源文件与转移记录（transferhistory）；数据文件跨站共享自动降级为仅删任务、保留文件；识别不到种子名或未命中下载器则跳过；回收站审计记录按保留天数自动清理（0=永久）；支持自动删除/仅记录双模式，清理后回执。",
     "labels": "下载",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/torrent.png",
     "author": "Finn",
     "level": 1,
     "v2": true,
     "v3": true,
     "history": {
+      "v1.1.2": "修复 V3 下站点消息类型比较失效导致插件完全不处理删种站内信的问题：V3 的 NotificationType.SiteMessage 为纯 Enum（非 str），与数据库 mtype 中文字符串\"站点\"直接比较恒为 False；新增 _is_site_message 兼容判定（枚举取 .value、字符串取自身后统一按字符串比较），实时事件与兜底扫描两处入口均改用之；插件版本升至 1.1.2",
       "v1.1.1": "修复 V3 宿主页面按钮/勾选报「服务器返回了无效响应」且删除后结果页不刷新的问题：自定义 API 响应统一为 V3 {success,message,data} 信封",
       "v1.0.0": "首个版本：订阅 NoticeMessage 事件检测站点删除种子站内信，自动删除对应种子+数据源文件+转移记录；数据共享保护（跨站共享仅删任务）；回收站审计记录保留天数滚动清理；自动/仅记录双模式；清理后回执",
       "v1.1.0": "修复启用后「立即运行一次」把配置冲掉导致插件实际未生效的问题（onlyonce 重置改为合并写配置）；「立即运行一次」改为兜底扫描——读 message 表最近站点消息，处理插件启用前漏掉的删种消息（持久化去重防重复）；新增 /scan 手动扫描 API 与「扫描条数」配置；新增扫描按钮"
