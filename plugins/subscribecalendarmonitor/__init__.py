@@ -295,7 +295,7 @@ class SubscribeCalendarMonitor(_PluginBase):
         """
         result = {"today_eps": [], "tmdb_fail": [], "total_subs": 0, "active_tv_subs": 0}
 
-        subscribes = self._subscribe_oper.list(state="R")
+        subscribes = self._subscribe_oper.list(state="R,P")
         if not subscribes:
             return result
         result["total_subs"] = len(subscribes)
