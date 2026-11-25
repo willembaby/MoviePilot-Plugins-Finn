@@ -29,7 +29,7 @@ class SubscribeCalendarMonitor(_PluginBase):
     plugin_name = "订阅日历监控"
     plugin_desc = "监控订阅剧集播出情况，检查当日播出剧集是否已下载入库，并发送通知。V3 专用版：订阅身份迁移到 media_source/media_id，导入迁移到 app.sdk 稳定入口。"
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     plugin_author = "Finn"
     author_url = "https://github.com"
     plugin_config_prefix = "subscribecalendarmonitor_"
